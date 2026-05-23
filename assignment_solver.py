@@ -1,0 +1,226 @@
+"""End-to-end MCTS pin assignment flow."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from typing import Dict, List, Set
+
+from PlaceDB import Net, Pin, PlaceDB
+from homology import HomologyManager, PinHomologyGroup
+from mcts import MCTSSolver, get_simulation_budget
+from segment import SegmentManager
+
+
+class AssignmentSolver:
+    """串联解析、同构分组、MCTS 搜索、实际提交和结果输出。"""
+
+    def __init__(
+        self,
+        block_json_path: str,
+        pingroup_json_path: str,
+        simulations: int | None = None,
+        random_seed: int = 7,
+        allow_overflow_fallback: bool = True,
+    ):
+        """初始化数据库、同构管理器、segment 管理器和求解参数。"""
+        self.placedb = PlaceDB(block_json_path, pingroup_json_path)
+        self.homology = HomologyManager(self.placedb)
+        self.segment_manager = SegmentManager(self.placedb)
+        self.simulations = simulations
+        self.random_seed = random_seed
+        self.allow_overflow_fallback = allow_overflow_fallback
+        self.assignment_rounds = 0
+        self.assignment_issues: List[Dict[str, object]] = []
+
+    def solve(self) -> Dict[str, object]:
+        """执行完整分配流程，并返回最终输出数据结构。"""
+        for seed_group in self.homology.unassigned_groups():
+            if seed_group.assigned:
+                continue
+            nets = self.homology.get_related_nets(seed_group)
+            if not nets:
+                self._assign_group_greedily(seed_group, "no_related_net")
+                continue
+
+            pins_in = self._collect_pins(nets)
+            related_groups = [
+                group
+                for group in self.homology.groups_for_pins(pins_in)
+                if not group.assigned
+            ]
+            if not related_groups:
+                self._assign_group_greedily(seed_group, "no_related_unassigned_group")
+                continue
+
+            budget = self.simulations or get_simulation_budget(len(related_groups))
+            mcts = MCTSSolver(
+                placedb=self.placedb,
+                segment_manager=self.segment_manager,
+                groups=related_groups,
+                nets=nets,
+                simulations=budget,
+                random_seed=self.random_seed + self.assignment_rounds,
+            )
+            proposed_assignment = mcts.search()
+            self._commit_contained_groups(related_groups, pins_in, proposed_assignment)
+            self.assignment_rounds += 1
+
+        self._finalize_unassigned_groups()
+        return self.build_output()
+
+    def _collect_pins(self, nets: List[Net]) -> List[Pin]:
+        """从一批 Net 中收集去重后的 pins_in。"""
+        pins_by_name: Dict[str, Pin] = {}
+        for net in nets:
+            for pin in net.pins:
+                pins_by_name[pin.full_name] = pin
+        return list(pins_by_name.values())
+
+    def _commit_contained_groups(
+        self,
+        related_groups: List[PinHomologyGroup],
+        pins_in: List[Pin],
+        proposed_assignment: Dict[str, str],
+    ) -> int:
+        """提交当前 pins_in 中完整包含的同构组分配结果。"""
+        pin_full_names: Set[str] = {pin.full_name for pin in pins_in}
+        contained_groups = self.homology.fully_contained_groups(related_groups, pin_full_names)
+        committed_count = 0
+        for group in contained_groups:
+            if group.assigned:
+                continue
+            segment_id = proposed_assignment.get(group.name)
+            if segment_id is None:
+                if self._assign_group_greedily(group, "missing_mcts_assignment"):
+                    committed_count += 1
+                continue
+            invalid_reason = self._validate_segment_assignment(group, segment_id)
+            if invalid_reason is not None:
+                if self._assign_group_greedily(group, invalid_reason):
+                    committed_count += 1
+                continue
+            self._commit_group_assignment(group, segment_id)
+            committed_count += 1
+        return committed_count
+
+    def _validate_segment_assignment(
+        self,
+        group: PinHomologyGroup,
+        segment_id: str,
+    ) -> str | None:
+        """校验 MCTS 给出的 segment 是否存在、类型匹配且容量可用。"""
+        segment = self.segment_manager.abstract_segments.get(segment_id)
+        if segment is None:
+            return "invalid_mcts_segment"
+        if segment.module_name != group.module_name:
+            return "segment_module_mismatch"
+        if not segment.can_fit(group.max_pin_width):
+            return "capacity_exceeded"
+        for pin in group.pins:
+            if (pin.parent_inst, segment_id) not in self.segment_manager.instance_lookup:
+                return "missing_segment_instance"
+        return None
+
+    def _assign_group_greedily(self, group: PinHomologyGroup, fallback_reason: str) -> bool:
+        """在 MCTS 未给出可提交方案时，用贪心策略兜底分配。"""
+        if group.assigned:
+            return True
+        candidates = self.segment_manager.candidates_for_module(group.module_name)
+        if not candidates:
+            self._record_assignment_issue(group, "no_candidate_segment", fallback_reason)
+            return False
+
+        feasible = [segment for segment in candidates if segment.can_fit(group.max_pin_width)]
+        if not feasible:
+            if self.allow_overflow_fallback:
+                segment = max(candidates, key=lambda item: (item.remaining_capacity, item.capacity))
+                self._record_assignment_issue(
+                    group,
+                    "forced_overflow_assignment",
+                    fallback_reason,
+                )
+                self._commit_group_assignment(group, segment.segment_id, allow_overflow=True)
+                return True
+            self._record_assignment_issue(group, "capacity_exceeded", fallback_reason)
+            return False
+
+        segment = max(feasible, key=lambda item: item.remaining_capacity)
+        self._commit_group_assignment(group, segment.segment_id)
+        return True
+
+    def _commit_group_assignment(
+        self,
+        group: PinHomologyGroup,
+        segment_id: str,
+        allow_overflow: bool = False,
+    ) -> None:
+        """把单个同构组实际写入 segment，并更新同构分配状态。"""
+        self.segment_manager.apply_assignment(
+            group.name,
+            group.pins,
+            segment_id,
+            allow_overflow=allow_overflow,
+        )
+        self.homology.mark_assigned(group, segment_id)
+
+    def _finalize_unassigned_groups(self) -> None:
+        """最终扫描所有未分配组，尽量用兜底策略完成分配。"""
+        for group in self.homology.unassigned_groups():
+            self._assign_group_greedily(group, "final_unassigned_sweep")
+
+    def _record_assignment_issue(
+        self,
+        group: PinHomologyGroup,
+        reason: str,
+        detail: str,
+    ) -> None:
+        """记录分配异常或 overflow 兜底，便于输出诊断。"""
+        self.assignment_issues.append(
+            {
+                "group": group.name,
+                "reason": reason,
+                "detail": detail,
+                "pin_count": len(group.pins),
+                "pin_names": [pin.full_name for pin in group.pins],
+            }
+        )
+
+    def build_output(self) -> Dict[str, object]:
+        """构建包含 summary、诊断信息和 segment 结果的输出字典。"""
+        assigned_pin_count = sum(1 for pin in self.placedb.pin_dict.values() if pin.assigned_segment_id)
+        unassigned_groups = [
+            {
+                "group": group.name,
+                "pin_count": len(group.pins),
+                "pin_names": [pin.full_name for pin in group.pins],
+            }
+            for group in self.homology.unassigned_groups()
+        ]
+        capacity_violations = self.segment_manager.capacity_violations()
+        return {
+            "summary": {
+                "module_count": len(self.placedb.all_modules_list),
+                "net_count": len(self.placedb.nets_list),
+                "pin_count": self.placedb.total_pin_count,
+                "assigned_pin_count": assigned_pin_count,
+                "unassigned_pin_count": self.placedb.total_pin_count - assigned_pin_count,
+                "homology_group_count": len(self.homology.pin_groups),
+                "unassigned_group_count": len(unassigned_groups),
+                "assignment_issue_count": len(self.assignment_issues),
+                "capacity_violation_count": len(capacity_violations),
+                "assignment_rounds": self.assignment_rounds,
+            },
+            "unassigned_groups": unassigned_groups,
+            "assignment_issues": self.assignment_issues,
+            "capacity_violations": capacity_violations,
+            "segments": self.segment_manager.to_output_dict(),
+        }
+
+    def write_output(self, output_path: str) -> Dict[str, object]:
+        """运行求解并把输出 JSON 写到指定路径。"""
+        result = self.solve()
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        return result

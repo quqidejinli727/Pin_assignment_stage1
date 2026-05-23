@@ -1,0 +1,241 @@
+"""MCTS tree for one local ``pins_in`` assignment batch."""
+
+from __future__ import annotations
+
+import math
+import random
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Tuple
+
+from PlaceDB import Net, PlaceDB
+from geometry_utils import Point
+from homology import PinHomologyGroup
+from scoring import assignment_reward
+from segment import AbstractSegment, SegmentManager, SegmentUsage
+
+
+Action = Tuple[str, str]
+
+
+@dataclass
+class MCTSNode:
+    """MCTS 树节点，表示已为前若干同构组选择了 segment。"""
+
+    group_index: int
+    usage: SegmentUsage
+    assignments: Dict[str, str]
+    parent: Optional["MCTSNode"] = None
+    action: Optional[Action] = None
+    children: List["MCTSNode"] = field(default_factory=list)
+    visits: int = 0
+    total_reward: float = 0.0
+    untried_actions: Optional[List[Action]] = None
+
+    @property
+    def average_reward(self) -> float:
+        """返回该节点的平均 reward，用于选择最佳路径。"""
+        if self.visits == 0:
+            return float("-inf")
+        return self.total_reward / self.visits
+
+
+class MCTSSolver:
+    """针对一批 pins_in 相关同构组运行一棵 MCTS 树。"""
+
+    def __init__(
+        self,
+        placedb: PlaceDB,
+        segment_manager: SegmentManager,
+        groups: List[PinHomologyGroup],
+        nets: Iterable[Net],
+        simulations: int = 128,
+        exploration_constant: float = 1.414,
+        random_seed: int = 7,
+    ):
+        """初始化 MCTS 搜索所需的数据、参数和随机数种子。"""
+        self.placedb = placedb
+        self.segment_manager = segment_manager
+        self.groups = groups
+        self.nets = list(nets)
+        self.simulations = simulations
+        self.exploration_constant = exploration_constant
+        self.random = random.Random(random_seed)
+
+    def search(self) -> Dict[str, str]:
+        """执行 MCTS 搜索，并返回同构组到抽象 segment 的分配方案。"""
+        root = MCTSNode(
+            group_index=0,
+            usage=self.segment_manager.snapshot_usage(),
+            assignments={},
+        )
+
+        if not self.groups:
+            return {}
+
+        for _ in range(self.simulations):
+            node = self._select(root)
+            if node.group_index < len(self.groups):
+                node = self._expand(node)
+            reward = self._simulate(node)
+            self._backpropagate(node, reward)
+
+        best = self._best_child_by_reward(root)
+        if best is None:
+            return self._greedy_assignment(root.usage)
+        return self._extract_best_path(best)
+
+    def _select(self, node: MCTSNode) -> MCTSNode:
+        """从根节点向下选择，直到遇到可扩展节点或叶节点。"""
+        while node.group_index < len(self.groups):
+            actions = self._available_actions(node)
+            if actions:
+                return node
+            if not node.children:
+                return node
+            node = max(node.children, key=lambda child: self._ucb(child))
+        return node
+
+    def _expand(self, node: MCTSNode) -> MCTSNode:
+        """从当前节点随机扩展一个尚未尝试的合法 action。"""
+        actions = self._available_actions(node)
+        if not actions:
+            return node
+        action = actions.pop(self.random.randrange(len(actions)))
+        group_name, segment_id = action
+        group = self.groups[node.group_index]
+        segment = self.segment_manager.abstract_segments[segment_id]
+
+        usage = node.usage.clone()
+        usage.assign(segment, group.max_pin_width)
+        assignments = dict(node.assignments)
+        assignments[group_name] = segment_id
+
+        child = MCTSNode(
+            group_index=node.group_index + 1,
+            usage=usage,
+            assignments=assignments,
+            parent=node,
+            action=action,
+        )
+        node.children.append(child)
+        return child
+
+    def _available_actions(self, node: MCTSNode) -> List[Action]:
+        """枚举当前层同构组可选择且满足容量的 segment action。"""
+        if node.group_index >= len(self.groups):
+            return []
+        if node.untried_actions is not None:
+            return node.untried_actions
+
+        group = self.groups[node.group_index]
+        actions = []
+        for segment in self.segment_manager.candidates_for_module(group.module_name):
+            if node.usage.can_assign(segment, group.max_pin_width):
+                actions.append((group.name, segment.segment_id))
+        node.untried_actions = actions
+        return node.untried_actions
+
+    def _simulate(self, node: MCTSNode) -> float:
+        """从当前节点开始随机补全剩余分配并计算 reward。"""
+        usage = node.usage.clone()
+        assignments = dict(node.assignments)
+        for index in range(node.group_index, len(self.groups)):
+            group = self.groups[index]
+            feasible = [
+                segment
+                for segment in self.segment_manager.candidates_for_module(group.module_name)
+                if usage.can_assign(segment, group.max_pin_width)
+            ]
+            if not feasible:
+                return -1.0e30
+            segment = self.random.choice(feasible)
+            usage.assign(segment, group.max_pin_width)
+            assignments[group.name] = segment.segment_id
+
+        temporary_locations = self._temporary_locations(assignments)
+        return assignment_reward(self.nets, self.placedb, temporary_locations)
+
+    def _temporary_locations(self, assignments: Dict[str, str]) -> Dict[str, Point]:
+        """把临时分配方案转换成 Pin 到 segment 中点坐标的映射。"""
+        locations = {}
+        for group in self.groups:
+            segment_id = assignments.get(group.name)
+            if segment_id is None:
+                continue
+            for pin in group.pins:
+                try:
+                    instance = self.segment_manager.get_instance(pin.parent_inst, segment_id)
+                except KeyError:
+                    continue
+                locations[pin.full_name] = instance.midpoint
+        return locations
+
+    def _backpropagate(self, node: MCTSNode, reward: float) -> None:
+        """把一次模拟的 reward 从叶节点回传到根节点。"""
+        current: Optional[MCTSNode] = node
+        while current is not None:
+            current.visits += 1
+            current.total_reward += reward
+            current = current.parent
+
+    def _ucb(self, child: MCTSNode) -> float:
+        """计算 UCB 值，平衡已知收益和探索新分支。"""
+        if child.visits == 0:
+            return float("inf")
+        parent_visits = max(child.parent.visits if child.parent else 1, 1)
+        exploitation = child.total_reward / child.visits
+        exploration = self.exploration_constant * math.sqrt(
+            math.log(parent_visits) / child.visits
+        )
+        return exploitation + exploration
+
+    def _best_child_by_reward(self, node: MCTSNode) -> Optional[MCTSNode]:
+        """返回某节点下平均 reward 最高的子节点。"""
+        if not node.children:
+            return None
+        return max(node.children, key=lambda child: child.average_reward)
+
+    def _extract_best_path(self, start: MCTSNode) -> Dict[str, str]:
+        """沿平均 reward 最优的子节点提取最终分配路径。"""
+        node = start
+        while node.children:
+            node = max(node.children, key=lambda child: child.average_reward)
+        if len(node.assignments) < len(self.groups):
+            return self._complete_greedily(node.assignments, node.usage)
+        return node.assignments
+
+    def _complete_greedily(
+        self,
+        assignments: Dict[str, str],
+        usage: SegmentUsage,
+    ) -> Dict[str, str]:
+        """当最佳路径未覆盖所有组时，用贪心方式补全剩余组。"""
+        completed = dict(assignments)
+        local_usage = usage.clone()
+        assigned_names = set(completed)
+        for group in self.groups:
+            if group.name in assigned_names:
+                continue
+            feasible = [
+                segment
+                for segment in self.segment_manager.candidates_for_module(group.module_name)
+                if local_usage.can_assign(segment, group.max_pin_width)
+            ]
+            if not feasible:
+                continue
+            segment = max(feasible, key=lambda item: item.remaining_capacity)
+            local_usage.assign(segment, group.max_pin_width)
+            completed[group.name] = segment.segment_id
+        return completed
+
+    def _greedy_assignment(self, usage: SegmentUsage) -> Dict[str, str]:
+        """在没有可用 MCTS 子节点时，直接生成贪心分配方案。"""
+        return self._complete_greedily({}, usage)
+
+
+def get_simulation_budget(group_count: int, base: int = 128) -> int:
+    """根据当前树深度返回 MCTS 模拟次数。
+
+    当前原型只做轻量动态调整，避免大数据集运行过慢。
+    """
+    return max(base, min(512, base + group_count * 16))
