@@ -3,6 +3,8 @@ from pathlib import Path
 
 from assignment_solver import AssignmentSolver
 from geometry_utils import align_vertices_to_reference
+from homology import HomologyManager
+from mcts import MCTSNode, MCTSSolver
 from segment import SegmentManager
 from PlaceDB import PlaceDB
 
@@ -142,6 +144,134 @@ def test_solver_assigns_all_pins_and_respects_capacity(tmp_path):
         for instance in segment["segment_instances"].values():
             assigned_pin_names.extend(instance["assigned_pins"])
     assert sorted(assigned_pin_names) == sorted(solver.placedb.pin_dict)
+
+
+def test_mcts_scaled_budget_and_tail_decay(tmp_path):
+    """验证新 MCTS 搜索预算公式和长尾衰减。"""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=1000,
+        budget_decay=0.5,
+        tail_decay=0.8,
+        typical_depth=3,
+        space_scale_divisor=1000,
+        max_space_factor=10,
+        min_layer_simulations=1,
+        tail_depth=3,
+    )
+
+    usage = segments.snapshot_usage()
+    assert mcts._search_space_factor(usage) == 0.064
+    assert mcts._total_simulation_budget(usage) == 64
+    assert mcts._layer_budget(1000, 1) == 1000
+    assert mcts._layer_budget(1000, 2) == 500
+    assert mcts._layer_budget(1000, 3) == 250
+    assert mcts._layer_budget(1000, 4) == 200
+
+
+def test_mcts_layer_search_descends_one_child_per_level(tmp_path):
+    """验证逐层搜索每层只承诺一个子节点，剩余分配由贪心补全。"""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=16,
+        min_layer_simulations=1,
+        typical_depth=1,
+        space_scale_divisor=1,
+        tail_depth=1,
+        enable_tail_early_stop=True,
+    )
+
+    calls = {"early_stop": 0}
+
+    def always_stop(_children):
+        calls["early_stop"] += 1
+        return True
+
+    mcts._has_decisive_ucb_lead = always_stop
+    assignment = mcts.search()
+
+    assert calls["early_stop"] == 1
+    assert set(assignment) == {group.name for group in groups}
+
+
+def test_mcts_tail_early_stop_can_be_disabled(tmp_path):
+    """验证禁用早停后，即使进入长尾也不会调用领先判断。"""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=16,
+        min_layer_simulations=1,
+        typical_depth=1,
+        space_scale_divisor=1,
+        tail_depth=1,
+        enable_tail_early_stop=False,
+    )
+
+    def fail_if_called(_children):
+        raise AssertionError("early stop should be disabled")
+
+    mcts._has_decisive_ucb_lead = fail_if_called
+    assignment = mcts.search()
+
+    assert set(assignment) == {group.name for group in groups}
+
+
+def test_mcts_ucb_lead_uses_same_layer_std(tmp_path):
+    """验证长尾早停口径使用同层子节点 UCB 分数标准差。"""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        early_stop_std_multiplier=2.0,
+    )
+    parent = MCTSNode(
+        group_index=0,
+        usage=segments.snapshot_usage(),
+        assignments={},
+        visits=100,
+    )
+    children = []
+    for total_reward in [10000.0, 0.0, 0.0]:
+        child = MCTSNode(
+            group_index=1,
+            usage=segments.snapshot_usage(),
+            assignments={},
+            parent=parent,
+            visits=10,
+            total_reward=total_reward,
+        )
+        children.append(child)
+
+    assert mcts._has_decisive_ucb_lead(children)
 
 
 def test_overflow_fallback_completes_assignment_when_pin_is_wider_than_edge(tmp_path):

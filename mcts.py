@@ -51,7 +51,15 @@ class MCTSSolver:
         simulations: int = 128,
         exploration_constant: float = 1.414,
         random_seed: int = 7,
-        **_: object,
+        budget_decay: float = 0.6,
+        tail_decay: float = 0.9,
+        typical_depth: int = 6,
+        space_scale_divisor: float = 1_000_000.0,
+        max_space_factor: float = 10.0,
+        min_layer_simulations: int = 256,
+        tail_depth: int = 8,
+        early_stop_std_multiplier: float = 2.0,
+        enable_tail_early_stop: bool = True,
     ):
         """初始化 MCTS 搜索所需的数据、参数和随机数种子。"""
         self.placedb = placedb
@@ -61,9 +69,18 @@ class MCTSSolver:
         self.simulations = simulations
         self.exploration_constant = exploration_constant
         self.random = random.Random(random_seed)
+        self.budget_decay = budget_decay
+        self.tail_decay = tail_decay
+        self.typical_depth = typical_depth
+        self.space_scale_divisor = space_scale_divisor
+        self.max_space_factor = max_space_factor
+        self.min_layer_simulations = min_layer_simulations
+        self.tail_depth = tail_depth
+        self.early_stop_std_multiplier = early_stop_std_multiplier
+        self.enable_tail_early_stop = enable_tail_early_stop
 
     def search(self) -> Dict[str, str]:
-        """执行 MCTS 搜索，并返回同构组到抽象 segment 的分配方案。"""
+        """逐层执行 MCTS 搜索，并返回同构组到抽象 segment 的分配方案。"""
         root = MCTSNode(
             group_index=0,
             usage=self.segment_manager.snapshot_usage(),
@@ -73,35 +90,83 @@ class MCTSSolver:
         if not self.groups:
             return {}
 
-        for _ in range(self.simulations):
-            node = self._select(root)
-            if node.group_index < len(self.groups):
-                node = self._expand(node)
-            reward = self._simulate(node)
-            self._backpropagate(node, reward)
+        total_budget = self._total_simulation_budget(root.usage)
+        current = root
+        depth = 1
+        while current.group_index < len(self.groups):
+            children = self._ensure_children(current)
+            if not children:
+                if current is root:
+                    return self._greedy_assignment(root.usage)
+                return self._complete_greedily(current.assignments, current.usage)
 
-        best = self._best_child_by_reward(root)
-        if best is None:
-            return self._greedy_assignment(root.usage)
-        return self._extract_best_path(best)
+            for _ in range(self._layer_budget(total_budget, depth)):
+                child = self._select_layer_child(children)
+                reward = self._simulate(child)
+                self._record_layer_result(current, child, reward)
 
-    def _select(self, node: MCTSNode) -> MCTSNode:
-        """从根节点向下选择，直到遇到可扩展节点或叶节点。"""
-        while node.group_index < len(self.groups):
-            actions = self._available_actions(node)
-            if actions:
-                return node
-            if not node.children:
-                return node
-            node = max(node.children, key=lambda child: self._ucb(child))
-        return node
+            best = max(children, key=lambda child: self._ucb(child))
+            next_depth = depth + 1
+            if (
+                self.enable_tail_early_stop
+                and next_depth > self.tail_depth
+                and self._has_decisive_ucb_lead(children)
+            ):
+                current = best
+                break
 
-    def _expand(self, node: MCTSNode) -> MCTSNode:
-        """从当前节点随机扩展一个尚未尝试的合法 action。"""
-        actions = self._available_actions(node)
-        if not actions:
-            return node
-        action = actions.pop(self.random.randrange(len(actions)))
+            current = best
+            depth = next_depth
+
+        if len(current.assignments) < len(self.groups):
+            return self._complete_greedily(current.assignments, current.usage)
+        return current.assignments
+
+    def _total_simulation_budget(self, usage: SegmentUsage) -> int:
+        """根据搜索空间因子放大输入基准模拟次数。"""
+        space_factor = self._search_space_factor(usage)
+        scaled_budget = math.ceil(self.simulations * space_factor)
+        return max(self.min_layer_simulations, scaled_budget)
+
+    def _search_space_factor(self, usage: SegmentUsage) -> float:
+        """估算搜索空间放大系数。"""
+        if not self.groups or self.space_scale_divisor <= 0:
+            return 0.0
+        branch_counts = []
+        for group in self.groups:
+            count = sum(
+                1
+                for segment in self.segment_manager.candidates_for_module(group.module_name)
+                if usage.can_assign(segment, group.max_pin_width)
+            )
+            branch_counts.append(count)
+        average_branching = sum(branch_counts) / len(branch_counts) if branch_counts else 0.0
+        factor = (average_branching ** self.typical_depth) / self.space_scale_divisor
+        return min(factor, self.max_space_factor)
+
+    def _layer_budget(self, total_budget: int, depth: int) -> int:
+        """返回当前深度的一层局部竞争模拟次数。"""
+        if depth <= self.tail_depth:
+            multiplier = self.budget_decay ** (depth - 1)
+        else:
+            multiplier = (
+                self.budget_decay ** (self.tail_depth - 1)
+                * self.tail_decay ** (depth - self.tail_depth)
+            )
+        return max(self.min_layer_simulations, math.ceil(total_budget * multiplier))
+
+    def _ensure_children(self, node: MCTSNode) -> List[MCTSNode]:
+        """为当前层创建所有合法 action 子节点。"""
+        if node.children:
+            return node.children
+        actions = list(self._available_actions(node))
+        for action in actions:
+            self._create_child(node, action)
+        node.untried_actions = []
+        return node.children
+
+    def _create_child(self, node: MCTSNode, action: Action) -> MCTSNode:
+        """按给定 action 创建一个子节点。"""
         group_name, segment_id = action
         group = self.groups[node.group_index]
         segment = self.segment_manager.abstract_segments[segment_id]
@@ -120,6 +185,56 @@ class MCTSSolver:
         )
         node.children.append(child)
         return child
+
+    def _select_layer_child(self, children: List[MCTSNode]) -> MCTSNode:
+        """在当前层选择一个 child 进行快速评估。"""
+        unvisited = [child for child in children if child.visits == 0]
+        if unvisited:
+            return self.random.choice(unvisited)
+        return max(children, key=lambda child: self._ucb(child))
+
+    def _record_layer_result(
+        self,
+        parent: MCTSNode,
+        child: MCTSNode,
+        reward: float,
+    ) -> None:
+        """只更新当前层竞争统计。"""
+        parent.visits += 1
+        child.visits += 1
+        child.total_reward += reward
+
+    def _has_decisive_ucb_lead(self, children: List[MCTSNode]) -> bool:
+        """判断当前层最佳 UCB 是否显著领先。"""
+        if len(children) < 2:
+            return False
+        scores = [self._ucb(child) for child in children]
+        if any(math.isinf(score) or math.isnan(score) for score in scores):
+            return False
+        ordered = sorted(scores, reverse=True)
+        mean = sum(scores) / len(scores)
+        variance = sum((score - mean) ** 2 for score in scores) / len(scores)
+        std = math.sqrt(variance)
+        return ordered[0] - ordered[1] > self.early_stop_std_multiplier * std
+
+    def _select(self, node: MCTSNode) -> MCTSNode:
+        """从根节点向下选择，直到遇到可扩展节点或叶节点。"""
+        while node.group_index < len(self.groups):
+            actions = self._available_actions(node)
+            if actions:
+                return node
+            if not node.children:
+                return node
+            node = max(node.children, key=lambda child: self._ucb(child))
+        return node
+
+    def _expand(self, node: MCTSNode) -> MCTSNode:
+        """从当前节点随机扩展一个尚未尝试的合法 action。"""
+        actions = self._available_actions(node)
+        if not actions:
+            return node
+        action = actions.pop(self.random.randrange(len(actions)))
+        return self._create_child(node, action)
 
     def _available_actions(self, node: MCTSNode) -> List[Action]:
         """枚举当前层同构组可选择且满足容量的 segment action。"""
