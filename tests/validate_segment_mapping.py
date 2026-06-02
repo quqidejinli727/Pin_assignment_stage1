@@ -27,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from PlaceDB import PlaceDB  # noqa: E402
 from geometry_utils import signed_area  # noqa: E402
 from segment import SegmentManager  # noqa: E402
+from segment_subdivision import interpolate_edge, subdivision_specs  # noqa: E402
 
 Point = Tuple[float, float]
 
@@ -145,6 +146,7 @@ def validate_one_shape(
     shape_name: str,
     base_vertices: Sequence[Point],
     reference_direction: int,
+    max_segment_length: float | None = None,
 ) -> int:
     """构建一组复用 block，逐一验证每个实例所有 segment 端点。"""
     block, pingroup, expected_by_module = build_case(
@@ -160,14 +162,17 @@ def validate_one_shape(
         pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
 
         placedb = PlaceDB(str(block_path), str(pingroup_path))
-        segments = SegmentManager(placedb)
+        segments = SegmentManager(placedb, max_segment_length=max_segment_length)
+        specs = subdivision_specs(base_vertices, max_segment_length)
 
         checked = 0
         for module_inst, expected_vertices in expected_by_module.items():
-            for index in range(len(base_vertices)):
+            for index, spec in enumerate(specs):
                 segment = segments.get_instance(module_inst, f"{shape_name}:S{index}")
-                expected_start = expected_vertices[index]
-                expected_end = expected_vertices[(index + 1) % len(expected_vertices)]
+                edge_start = expected_vertices[spec.edge_id]
+                edge_end = expected_vertices[(spec.edge_id + 1) % len(expected_vertices)]
+                expected_start = interpolate_edge(edge_start, edge_end, spec.t_start)
+                expected_end = interpolate_edge(edge_start, edge_end, spec.t_end)
                 context = f"{shape_name}, ref_dir={reference_direction}, {module_inst}, S{index}"
                 assert_point_equal(segment.start, expected_start, f"{context} start")
                 assert_point_equal(segment.end, expected_end, f"{context} end")
@@ -181,9 +186,16 @@ def main() -> None:
     for shape_name, vertices in SHAPES.items():
         for reference_direction in range(8):
             checked += validate_one_shape(shape_name, vertices, reference_direction)
+            checked += validate_one_shape(
+                shape_name,
+                vertices,
+                reference_direction,
+                max_segment_length=6.0,
+            )
     print(
         "Segment mapping validation passed: "
-        f"{len(SHAPES)} shapes, 8 reference directions, {checked} segment instances checked."
+        f"{len(SHAPES)} shapes, 8 reference directions, original and subdivided edges, "
+        f"{checked} segment instances checked."
     )
 
 

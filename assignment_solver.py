@@ -10,6 +10,7 @@ from PlaceDB import Net, Pin, PlaceDB
 from homology import HomologyManager, PinHomologyGroup
 from mcts import MCTSSolver, get_simulation_budget
 from segment import SegmentManager
+from segment_subdivision import percentile_edge_length
 
 
 class AssignmentSolver:
@@ -22,14 +23,44 @@ class AssignmentSolver:
         simulations: int | None = None,
         random_seed: int = 7,
         allow_overflow_fallback: bool = True,
+        enable_segment_subdivision: bool = True,
+        segment_length_percentile: int = 50,
+        mcts_budget_decay: float = 0.6,
+        mcts_tail_decay: float = 0.9,
+        mcts_typical_depth: int = 6,
+        mcts_space_scale_divisor: float = 1_000_000.0,
+        mcts_max_space_factor: float = 10.0,
+        mcts_min_layer_simulations: int = 256,
+        mcts_tail_depth: int = 8,
+        mcts_early_stop_std_multiplier: float = 2.0,
+        mcts_enable_tail_early_stop: bool = True,
     ):
         """初始化数据库、同构管理器、segment 管理器和求解参数。"""
         self.placedb = PlaceDB(block_json_path, pingroup_json_path)
         self.homology = HomologyManager(self.placedb)
-        self.segment_manager = SegmentManager(self.placedb)
+        self.max_segment_length = (
+            percentile_edge_length(block_json_path, segment_length_percentile)
+            if enable_segment_subdivision
+            else None
+        )
+        self.segment_manager = SegmentManager(
+            self.placedb,
+            max_segment_length=self.max_segment_length,
+        )
         self.simulations = simulations
         self.random_seed = random_seed
         self.allow_overflow_fallback = allow_overflow_fallback
+        self.mcts_options = {
+            "budget_decay": mcts_budget_decay,
+            "tail_decay": mcts_tail_decay,
+            "typical_depth": mcts_typical_depth,
+            "space_scale_divisor": mcts_space_scale_divisor,
+            "max_space_factor": mcts_max_space_factor,
+            "min_layer_simulations": mcts_min_layer_simulations,
+            "tail_depth": mcts_tail_depth,
+            "early_stop_std_multiplier": mcts_early_stop_std_multiplier,
+            "enable_tail_early_stop": mcts_enable_tail_early_stop,
+        }
         self.assignment_rounds = 0
         self.assignment_progress_index = 0
         self.assignment_issues: List[Dict[str, object]] = []
@@ -54,7 +85,11 @@ class AssignmentSolver:
                 self._assign_group_greedily(seed_group, "no_related_unassigned_group")
                 continue
 
-            budget = self.simulations or get_simulation_budget(len(related_groups))
+            budget = (
+                self.simulations
+                if self.simulations is not None
+                else get_simulation_budget(len(related_groups))
+            )
             mcts = MCTSSolver(
                 placedb=self.placedb,
                 segment_manager=self.segment_manager,
@@ -62,6 +97,7 @@ class AssignmentSolver:
                 nets=nets,
                 simulations=budget,
                 random_seed=self.random_seed + self.assignment_rounds,
+                **self.mcts_options,
             )
             proposed_assignment = mcts.search()
             self._commit_contained_groups(related_groups, pins_in, proposed_assignment)
@@ -220,6 +256,7 @@ class AssignmentSolver:
                 "assignment_issue_count": len(self.assignment_issues),
                 "capacity_violation_count": len(capacity_violations),
                 "assignment_rounds": self.assignment_rounds,
+                "max_segment_length": self.max_segment_length,
             },
             "unassigned_groups": unassigned_groups,
             "assignment_issues": self.assignment_issues,

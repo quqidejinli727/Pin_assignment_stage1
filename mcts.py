@@ -51,6 +51,7 @@ class MCTSSolver:
         simulations: int = 128,
         exploration_constant: float = 1.414,
         random_seed: int = 7,
+        **_: object,
     ):
         """初始化 MCTS 搜索所需的数据、参数和随机数种子。"""
         self.placedb = placedb

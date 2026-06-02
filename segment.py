@@ -13,6 +13,7 @@ from geometry_utils import (
     segment_length,
     segment_midpoint,
 )
+from segment_subdivision import EdgeSubdivision, interpolate_edge, subdivision_specs
 
 
 @dataclass
@@ -34,6 +35,8 @@ class AbstractSegment:
     segment_id: str
     module_name: str
     index: int
+    edge_id: int
+    child_index: int
     capacity: float
     used_width: float = 0.0
     assigned_groups: List[str] = field(default_factory=list)
@@ -74,9 +77,10 @@ class SegmentUsage:
 class SegmentManager:
     """构建并管理抽象 segment、实例 segment 和容量使用情况。"""
 
-    def __init__(self, placedb: PlaceDB):
+    def __init__(self, placedb: PlaceDB, max_segment_length: float | None = None):
         """根据 PlaceDB 中带 Pin 的模块创建 segment 结构。"""
         self.placedb = placedb
+        self.max_segment_length = max_segment_length
         self.abstract_segments: Dict[str, AbstractSegment] = {}
         self.segments_by_module_name: Dict[str, List[AbstractSegment]] = {}
         self.instance_lookup: Dict[Tuple[str, str], SegmentInstance] = {}
@@ -106,17 +110,17 @@ class SegmentManager:
             reference.vertex,
             int(reference.direction),
         )
-        split_vertices = self.split_segments(reference_vertices)
-        segment_count = len(split_vertices)
+        split_specs = self.split_segments(reference_vertices)
 
-        for index in range(segment_count):
-            start = split_vertices[index]
-            end = split_vertices[(index + 1) % segment_count]
+        for index, spec in enumerate(split_specs):
+            start, end = self._segment_coordinates(reference_vertices, spec)
             segment_id = f"{module_name}:S{index}"
             abstract = AbstractSegment(
                 segment_id=segment_id,
                 module_name=module_name,
                 index=index,
+                edge_id=spec.edge_id,
+                child_index=spec.child_index,
                 capacity=segment_length(start, end),
             )
             self.abstract_segments[segment_id] = abstract
@@ -129,9 +133,8 @@ class SegmentManager:
                 int(module.direction),
                 int(reference.direction),
             )
-            for index in range(segment_count):
-                start = aligned_vertices[index]
-                end = aligned_vertices[(index + 1) % segment_count]
+            for index, spec in enumerate(split_specs):
+                start, end = self._segment_coordinates(aligned_vertices, spec)
                 segment_id = f"{module_name}:S{index}"
                 instance = SegmentInstance(
                     segment_id=segment_id,
@@ -143,12 +146,25 @@ class SegmentManager:
                 self.abstract_segments[segment_id].instances[module.name] = instance
                 self.instance_lookup[(module.name, segment_id)] = instance
 
-    def split_segments(self, reference_vertices: List[Point]) -> List[Point]:
+    def split_segments(self, reference_vertices: List[Point]) -> List[EdgeSubdivision]:
         """segment 切割预留接口。
 
-        当前版本直接使用原始多边形边；后续可在这里插入额外断点。
+        返回每条母边的比例裁剪规格，所有复用实例使用同一份规格。
         """
-        return reference_vertices
+        return subdivision_specs(reference_vertices, self.max_segment_length)
+
+    def _segment_coordinates(
+        self,
+        vertices: List[Point],
+        spec: EdgeSubdivision,
+    ) -> Tuple[Point, Point]:
+        """把母边比例裁剪规格应用到某一实例的对应真实边。"""
+        edge_start = vertices[spec.edge_id]
+        edge_end = vertices[(spec.edge_id + 1) % len(vertices)]
+        return (
+            interpolate_edge(edge_start, edge_end, spec.t_start),
+            interpolate_edge(edge_start, edge_end, spec.t_end),
+        )
 
     def candidates_for_module(self, module_name: str) -> List[AbstractSegment]:
         """返回某个 module_name 可选的抽象 segment 列表。"""
@@ -219,6 +235,8 @@ class SegmentManager:
             output[segment_id] = {
                 "module_name": segment.module_name,
                 "index": segment.index,
+                "edge_id": segment.edge_id,
+                "child_index": segment.child_index,
                 "capacity": segment.capacity,
                 "used_width": segment.used_width,
                 "assigned_groups": segment.assigned_groups,

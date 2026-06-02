@@ -4,38 +4,172 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
+from datetime import datetime
+from pathlib import Path
 
 from assignment_solver import AssignmentSolver
+from config import DEFAULT_CONFIG, RunConfig
+from export_final_result import write_interface_result
+from scoring import final_net_metrics, metrics_to_records, summarize_metrics
 
 
 def parse_args() -> argparse.Namespace:
-    """解析命令行参数，包括输入 JSON、输出路径和 MCTS 参数。"""
+    """解析可选命令行参数；未提供时使用 config.py 中的默认值。"""
     parser = argparse.ArgumentParser(description="Run MCTS pin-to-segment assignment.")
-    parser.add_argument("--block", required=True, help="Path to block JSON file.")
-    parser.add_argument("--pingroup", required=True, help="Path to pingroup JSON file.")
-    parser.add_argument("--output", required=True, help="Path to output assignment JSON.")
+    parser.add_argument("--block", default=None, help="Path to block JSON file.")
+    parser.add_argument("--pingroup", default=None, help="Path to pingroup JSON file.")
+    parser.add_argument("--output", default=None, help="Path to full assignment JSON output.")
+    parser.add_argument("--results-root", default=None, help="Directory for independent run reports.")
+    parser.add_argument("--interface-result-dir", default=None, help="Directory for interface-format output.")
     parser.add_argument("--simulations", type=int, default=None, help="MCTS simulations per local tree.")
-    parser.add_argument("--seed", type=int, default=7, help="Random seed.")
+    parser.add_argument("--seed", type=int, default=None, help="Random seed.")
     parser.add_argument(
         "--strict-capacity",
         action="store_true",
         help="Disable final overflow fallback for groups wider than every candidate segment.",
     )
+    parser.add_argument(
+        "--no-feedthrough",
+        action="store_true",
+        help="Skip predictor execution and record feedthrough as 0.",
+    )
+    parser.add_argument(
+        "--no-auto-build",
+        action="store_true",
+        help="Require a compiled predictor instead of compiling it automatically.",
+    )
+    parser.add_argument(
+        "--disable-subdivision",
+        action="store_true",
+        help="Keep original polygon edges without percentile segment subdivision.",
+    )
+    parser.add_argument(
+        "--segment-percentile",
+        type=int,
+        default=None,
+        help="Percentile used as maximum segment length threshold, default L50.",
+    )
+    parser.add_argument(
+        "--no-interface-result",
+        action="store_true",
+        help="Skip interface-format final_result export.",
+    )
     return parser.parse_args()
 
 
-def main() -> None:
-    """命令行主函数：创建求解器、执行分配并打印 summary。"""
-    args = parse_args()
-    solver = AssignmentSolver(
-        block_json_path=args.block,
-        pingroup_json_path=args.pingroup,
-        simulations=args.simulations,
-        random_seed=args.seed,
-        allow_overflow_fallback=not args.strict_capacity,
+def config_from_args(args: argparse.Namespace) -> RunConfig:
+    """使用命令行临时覆盖集中配置中的对应参数。"""
+    return replace(
+        DEFAULT_CONFIG,
+        block_json_path=Path(args.block) if args.block else DEFAULT_CONFIG.block_json_path,
+        pingroup_json_path=(
+            Path(args.pingroup) if args.pingroup else DEFAULT_CONFIG.pingroup_json_path
+        ),
+        assignment_output_path=(
+            Path(args.output) if args.output else DEFAULT_CONFIG.assignment_output_path
+        ),
+        results_root=Path(args.results_root) if args.results_root else DEFAULT_CONFIG.results_root,
+        interface_result_dir=(
+            Path(args.interface_result_dir)
+            if args.interface_result_dir
+            else DEFAULT_CONFIG.interface_result_dir
+        ),
+        simulations=args.simulations if args.simulations is not None else DEFAULT_CONFIG.simulations,
+        random_seed=args.seed if args.seed is not None else DEFAULT_CONFIG.random_seed,
+        allow_overflow_fallback=(
+            False if args.strict_capacity else DEFAULT_CONFIG.allow_overflow_fallback
+        ),
+        enable_feedthrough=False if args.no_feedthrough else DEFAULT_CONFIG.enable_feedthrough,
+        auto_build_feedthrough=(
+            False if args.no_auto_build else DEFAULT_CONFIG.auto_build_feedthrough
+        ),
+        enable_segment_subdivision=(
+            False if args.disable_subdivision else DEFAULT_CONFIG.enable_segment_subdivision
+        ),
+        segment_length_percentile=(
+            args.segment_percentile
+            if args.segment_percentile is not None
+            else DEFAULT_CONFIG.segment_length_percentile
+        ),
+        export_interface_result=(
+            False if args.no_interface_result else DEFAULT_CONFIG.export_interface_result
+        ),
     )
-    result = solver.write_output(args.output)
-    print(json.dumps(result["summary"], ensure_ascii=False, indent=2))
+
+
+def write_run_report(
+    config: RunConfig,
+    assignment_summary: dict,
+    metrics: list,
+) -> Path:
+    """把单次运行参数和最终 Net 指标保存到独立结果目录。"""
+    run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
+    run_dir = config.results_root / run_name
+    run_dir.mkdir(parents=True, exist_ok=False)
+    report_path = run_dir / "metrics.json"
+    report = {
+        "parameters": config.to_record(),
+        "assignment_summary": assignment_summary,
+        "metrics_summary": summarize_metrics(metrics),
+        "net_metrics": metrics_to_records(metrics),
+    }
+    report_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return report_path
+
+
+def main() -> None:
+    """执行分配，保存完整分配输出，并另外生成最终指标报告。"""
+    config = config_from_args(parse_args())
+    solver = AssignmentSolver(
+        block_json_path=str(config.block_json_path),
+        pingroup_json_path=str(config.pingroup_json_path),
+        simulations=config.simulations,
+        random_seed=config.random_seed,
+        allow_overflow_fallback=config.allow_overflow_fallback,
+        enable_segment_subdivision=config.enable_segment_subdivision,
+        segment_length_percentile=config.segment_length_percentile,
+        mcts_budget_decay=config.mcts_budget_decay,
+        mcts_tail_decay=config.mcts_tail_decay,
+        mcts_typical_depth=config.mcts_typical_depth,
+        mcts_space_scale_divisor=config.mcts_space_scale_divisor,
+        mcts_max_space_factor=config.mcts_max_space_factor,
+        mcts_min_layer_simulations=config.mcts_min_layer_simulations,
+        mcts_tail_depth=config.mcts_tail_depth,
+        mcts_early_stop_std_multiplier=config.mcts_early_stop_std_multiplier,
+        mcts_enable_tail_early_stop=config.mcts_enable_tail_early_stop,
+    )
+    assignment_result = solver.solve()
+    config.assignment_output_path.parent.mkdir(parents=True, exist_ok=True)
+    config.assignment_output_path.write_text(
+        json.dumps(assignment_result, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    metrics = final_net_metrics(
+        solver.placedb,
+        feedthrough_source_dir=config.feedthrough_source_dir,
+        enable_feedthrough=config.enable_feedthrough,
+        auto_build_feedthrough=config.auto_build_feedthrough,
+        cmake_generator=config.cmake_generator,
+    )
+    report_path = write_run_report(config, assignment_result["summary"], metrics)
+    interface_result_path = None
+    if config.export_interface_result:
+        interface_result_path = write_interface_result(
+            config.interface_result_dir,
+            solver.placedb,
+            solver.homology,
+            solver.segment_manager,
+        )
+    print(json.dumps(assignment_result["summary"], ensure_ascii=False, indent=2))
+    print(json.dumps(summarize_metrics(metrics), ensure_ascii=False, indent=2))
+    print(f"Assignment output: {config.assignment_output_path}")
+    print(f"Result report: {report_path}")
+    if interface_result_path is not None:
+        print(f"Interface result: {interface_result_path}")
 
 
 if __name__ == "__main__":
