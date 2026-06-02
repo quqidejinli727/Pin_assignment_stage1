@@ -31,6 +31,7 @@ class AssignmentSolver:
         self.random_seed = random_seed
         self.allow_overflow_fallback = allow_overflow_fallback
         self.assignment_rounds = 0
+        self.assignment_progress_index = 0
         self.assignment_issues: List[Dict[str, object]] = []
 
     def solve(self) -> Dict[str, object]:
@@ -163,6 +164,15 @@ class AssignmentSolver:
             allow_overflow=allow_overflow,
         )
         self.homology.mark_assigned(group, segment_id)
+        self._print_assignment_progress(group)
+
+    def _print_assignment_progress(self, group: PinHomologyGroup) -> None:
+        """打印同构组分配进度，编号按实际分配顺序从 0 开始。"""
+        print(
+            f"homology_batch_index={self.assignment_progress_index}, "
+            f"group={group.name}, pin_count={len(group.pins)}"
+        )
+        self.assignment_progress_index += 1
 
     def _finalize_unassigned_groups(self) -> None:
         """最终扫描所有未分配组，尽量用兜底策略完成分配。"""
