@@ -121,9 +121,10 @@ def write_run_report(
     return report_path
 
 
-def main() -> None:
-    """执行分配，保存完整分配输出，并另外生成最终指标报告。"""
-    config = config_from_args(parse_args())
+def run_pipline(config: RunConfig | None = None) -> Path:
+    """执行 Stage 1 分配流程，并返回可供后续阶段使用的结果路径。"""
+    if config is None:
+        config = config_from_args(parse_args())
     solver = AssignmentSolver(
         block_json_path=str(config.block_json_path),
         pingroup_json_path=str(config.pingroup_json_path),
@@ -170,7 +171,9 @@ def main() -> None:
     print(f"Result report: {report_path}")
     if interface_result_path is not None:
         print(f"Interface result: {interface_result_path}")
+        return interface_result_path
+    return config.assignment_output_path
 
 
 if __name__ == "__main__":
-    main()
+    run_pipline()
