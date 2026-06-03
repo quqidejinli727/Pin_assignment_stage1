@@ -10,7 +10,7 @@ from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Tuple
 
 from PlaceDB import Net, PlaceDB
 from feedthrough import ftpred_loader
@@ -37,6 +37,139 @@ def net_hpwl(
     return hpwl(points)
 
 
+@dataclass
+class NetReferenceMetrics:
+    """Reference metrics computed from each pin's parent-block centroid."""
+
+    hpwl: float
+    feedthrough: float = 0.0
+
+
+class RewardEvaluator:
+    """Evaluate MCTS rewards with per-net reference normalization."""
+
+    def __init__(
+        self,
+        nets: Iterable[Net],
+        placedb: PlaceDB,
+        *,
+        wirelength_weight: float = 1.0,
+        feedthrough_weight: float = 0.0,
+        feedthrough_source_dir: Path | None = None,
+        enable_feedthrough: bool = True,
+        auto_build_feedthrough: bool = True,
+        cmake_generator: str | None = None,
+        normalization_floor: float = 1.0,
+    ):
+        self.nets = list(nets)
+        self.placedb = placedb
+        self.wirelength_weight = wirelength_weight
+        self.feedthrough_weight = feedthrough_weight
+        self.enable_feedthrough = enable_feedthrough and feedthrough_weight != 0.0
+        self.normalization_floor = normalization_floor
+        self._session = None
+        self._candidate_feedthrough_cache: Dict[Tuple[int, Tuple[Point, ...]], float] = {}
+
+        if self.enable_feedthrough:
+            if feedthrough_source_dir is None:
+                raise ValueError("feedthrough_source_dir is required when feedthrough reward is enabled.")
+            executable = ensure_ftpred_executable(
+                feedthrough_source_dir,
+                auto_build=auto_build_feedthrough,
+                cmake_generator=cmake_generator,
+            )
+            modules_text = ftpred_loader.build_modules_text(placedb)
+            self._session = ftpred_loader.FtpredBinSession(str(executable), modules_text)
+
+        self.reference_metrics = {
+            id(net): self._build_reference_metrics(net)
+            for net in self.nets
+        }
+
+    def close(self) -> None:
+        """Close the optional feedthrough predictor session."""
+        if self._session is not None:
+            self._session.close()
+            self._session = None
+
+    def evaluate(self, temporary_locations: Dict[str, Point]) -> float:
+        """Return weighted normalized reward for a complete candidate assignment."""
+        total_reward = 0.0
+        for net in self.nets:
+            reference = self.reference_metrics[id(net)]
+            candidate_hpwl = net_hpwl(net, self.placedb, temporary_locations)
+            wirelength_reward = self._normalized_improvement(reference.hpwl, candidate_hpwl)
+
+            feedthrough_reward_value = 0.0
+            if self.enable_feedthrough:
+                candidate_feedthrough = self._candidate_feedthrough(net, temporary_locations)
+                feedthrough_reward_value = self._normalized_improvement(
+                    reference.feedthrough,
+                    candidate_feedthrough,
+                )
+
+            total_reward += (
+                self.wirelength_weight * wirelength_reward
+                + self.feedthrough_weight * feedthrough_reward_value
+            )
+        return total_reward
+
+    def _build_reference_metrics(self, net: Net) -> NetReferenceMetrics:
+        reference_locations = {
+            pin.full_name: self.placedb.get_module(pin.parent_inst).get_centroid()
+            for pin in net.pins
+        }
+        reference_hpwl = net_hpwl(net, self.placedb, reference_locations)
+        reference_feedthrough = (
+            self._feedthrough_at_locations(net, reference_locations)
+            if self.enable_feedthrough
+            else 0.0
+        )
+        return NetReferenceMetrics(reference_hpwl, reference_feedthrough)
+
+    def _candidate_feedthrough(
+        self,
+        net: Net,
+        temporary_locations: Dict[str, Point],
+    ) -> float:
+        locations = {
+            pin.full_name: temporary_locations.get(
+                pin.full_name,
+                self.placedb.get_pin_location_estimate(pin),
+            )
+            for pin in net.pins
+        }
+        key = (id(net), tuple(self._rounded_point(locations[pin.full_name]) for pin in net.pins))
+        if key not in self._candidate_feedthrough_cache:
+            self._candidate_feedthrough_cache[key] = self._feedthrough_at_locations(net, locations)
+        return self._candidate_feedthrough_cache[key]
+
+    def _feedthrough_at_locations(self, net: Net, locations: Dict[str, Point]) -> float:
+        if self._session is None:
+            return 0.0
+
+        old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
+        old_net_feedthrough = getattr(net, "feedthrough", 0.0)
+        try:
+            for pin in net.pins:
+                pin.x, pin.y = locations[pin.full_name]
+            with redirect_stdout(StringIO()):
+                return float(self._session.run_one_net(self.placedb, net))
+        finally:
+            for pin, x, y in old_pin_locations:
+                pin.x = x
+                pin.y = y
+            net.feedthrough = old_net_feedthrough
+
+    def _normalized_improvement(self, reference: float, candidate: float) -> float:
+        denominator = max(abs(reference), self.normalization_floor)
+        return (reference - candidate) / denominator
+
+    @staticmethod
+    def _rounded_point(point: Point) -> Point:
+        return (round(float(point[0]), 6), round(float(point[1]), 6))
+
+
 def assignment_reward(
     nets: Iterable[Net],
     placedb: PlaceDB,
@@ -44,8 +177,13 @@ def assignment_reward(
     feedthrough_weight: float = 0.0,
 ) -> float:
     """综合 HPWL 和 feedthrough，返回 MCTS 使用的 reward。"""
-    total_hpwl = sum(net_hpwl(net, placedb, temporary_locations) for net in nets)
-    return -total_hpwl + feedthrough_weight * feedthrough_reward(nets)
+    evaluator = RewardEvaluator(
+        nets,
+        placedb,
+        feedthrough_weight=feedthrough_weight,
+        enable_feedthrough=False,
+    )
+    return evaluator.evaluate(temporary_locations)
 
 
 @dataclass

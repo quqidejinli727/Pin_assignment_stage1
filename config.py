@@ -34,7 +34,9 @@ class RunConfig:
     enable_feedthrough: bool = True
     auto_build_feedthrough: bool = True
     cmake_generator: str = "MinGW Makefiles"
+    wirelength_reward_weight: float = 1.0
     feedthrough_weight: float = 0.0
+    reward_normalization_floor: float = 1.0
     enable_segment_subdivision: bool = True
     segment_length_percentile: int = 50
     export_interface_result: bool = True

@@ -5,12 +5,13 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from PlaceDB import Net, PlaceDB
 from geometry_utils import Point
 from homology import PinHomologyGroup
-from scoring import assignment_reward
+from scoring import RewardEvaluator
 from segment import AbstractSegment, SegmentManager, SegmentUsage
 
 
@@ -61,6 +62,13 @@ class MCTSSolver:
         tail_depth: int = 8,
         early_stop_std_multiplier: float = 2.0,
         enable_tail_early_stop: bool = True,
+        wirelength_weight: float = 1.0,
+        feedthrough_weight: float = 0.0,
+        reward_normalization_floor: float = 1.0,
+        feedthrough_source_dir: Path | None = None,
+        enable_feedthrough: bool = True,
+        auto_build_feedthrough: bool = True,
+        cmake_generator: str | None = None,
     ):
         """初始化 MCTS 搜索所需的数据、参数和随机数种子。"""
         self.placedb = placedb
@@ -80,17 +88,31 @@ class MCTSSolver:
         self.tail_depth = tail_depth
         self.early_stop_std_multiplier = early_stop_std_multiplier
         self.enable_tail_early_stop = enable_tail_early_stop
+        self.reward_evaluator = RewardEvaluator(
+            self.nets,
+            self.placedb,
+            wirelength_weight=wirelength_weight,
+            feedthrough_weight=feedthrough_weight,
+            feedthrough_source_dir=feedthrough_source_dir,
+            enable_feedthrough=enable_feedthrough,
+            auto_build_feedthrough=auto_build_feedthrough,
+            cmake_generator=cmake_generator,
+            normalization_floor=reward_normalization_floor,
+        )
 
     def search(self) -> Dict[str, str]:
         """执行已配置的 MCTS 搜索策略。"""
-        if self.search_mode == "basic":
-            return self._search_basic()
-        if self.search_mode == "layered":
-            return self._search_layered()
-        raise ValueError(
-            f"Unsupported MCTS search mode: {self.search_mode!r}. "
-            "Use 'layered' or 'basic'."
-        )
+        try:
+            if self.search_mode == "basic":
+                return self._search_basic()
+            if self.search_mode == "layered":
+                return self._search_layered()
+            raise ValueError(
+                f"Unsupported MCTS search mode: {self.search_mode!r}. "
+                "Use 'layered' or 'basic'."
+            )
+        finally:
+            self.reward_evaluator.close()
 
     def _search_layered(self) -> Dict[str, str]:
         """逐层执行 MCTS 搜索，并返回同构组到抽象 segment 的分配方案。"""
@@ -305,7 +327,7 @@ class MCTSSolver:
             assignments[group.name] = segment.segment_id
 
         temporary_locations = self._temporary_locations(assignments)
-        return assignment_reward(self.nets, self.placedb, temporary_locations)
+        return self.reward_evaluator.evaluate(temporary_locations)
 
     def _temporary_locations(self, assignments: Dict[str, str]) -> Dict[str, Point]:
         """把临时分配方案转换成 Pin 到 segment 中点坐标的映射。"""

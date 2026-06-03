@@ -99,6 +99,13 @@ def run_mcts(
         mcts_tail_depth=config.mcts_tail_depth,
         mcts_early_stop_std_multiplier=config.mcts_early_stop_std_multiplier,
         mcts_enable_tail_early_stop=config.mcts_enable_tail_early_stop,
+        wirelength_reward_weight=config.wirelength_reward_weight,
+        feedthrough_weight=config.feedthrough_weight,
+        reward_normalization_floor=config.reward_normalization_floor,
+        feedthrough_source_dir=config.feedthrough_source_dir,
+        enable_feedthrough=config.enable_feedthrough,
+        auto_build_feedthrough=config.auto_build_feedthrough,
+        cmake_generator=config.cmake_generator if os.name == "nt" else None,
     )
     assignment_result = solver.solve()
     config.assignment_output_path.write_text(

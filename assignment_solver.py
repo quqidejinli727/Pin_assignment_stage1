@@ -35,6 +35,13 @@ class AssignmentSolver:
         mcts_tail_depth: int = 8,
         mcts_early_stop_std_multiplier: float = 2.0,
         mcts_enable_tail_early_stop: bool = True,
+        wirelength_reward_weight: float = 1.0,
+        feedthrough_weight: float = 0.0,
+        reward_normalization_floor: float = 1.0,
+        feedthrough_source_dir: str | Path | None = None,
+        enable_feedthrough: bool = True,
+        auto_build_feedthrough: bool = True,
+        cmake_generator: str | None = None,
     ):
         """初始化数据库、同构管理器、segment 管理器和求解参数。"""
         self.placedb = PlaceDB(block_json_path, pingroup_json_path)
@@ -62,6 +69,13 @@ class AssignmentSolver:
             "tail_depth": mcts_tail_depth,
             "early_stop_std_multiplier": mcts_early_stop_std_multiplier,
             "enable_tail_early_stop": mcts_enable_tail_early_stop,
+            "wirelength_weight": wirelength_reward_weight,
+            "feedthrough_weight": feedthrough_weight,
+            "reward_normalization_floor": reward_normalization_floor,
+            "feedthrough_source_dir": Path(feedthrough_source_dir) if feedthrough_source_dir else None,
+            "enable_feedthrough": enable_feedthrough,
+            "auto_build_feedthrough": auto_build_feedthrough,
+            "cmake_generator": cmake_generator,
         }
         self.assignment_rounds = 0
         self.assignment_progress_index = 0

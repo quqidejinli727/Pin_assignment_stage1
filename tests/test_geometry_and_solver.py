@@ -5,6 +5,7 @@ from assignment_solver import AssignmentSolver
 from geometry_utils import align_vertices_to_reference
 from homology import HomologyManager
 from mcts import MCTSNode, MCTSSolver
+from scoring import RewardEvaluator
 from segment import SegmentManager
 from PlaceDB import PlaceDB
 
@@ -158,6 +159,27 @@ def test_solver_supports_basic_mcts_search_mode(tmp_path):
     result = solver.solve()
     assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
     assert result["summary"]["unassigned_group_count"] == 0
+
+
+def test_reward_evaluator_normalizes_against_centroid_reference(tmp_path):
+    """Verify per-net HPWL reward is normalized against cached centroid references."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    evaluator = RewardEvaluator(
+        placedb.nets_list,
+        placedb,
+        wirelength_weight=1.0,
+        feedthrough_weight=0.0,
+        enable_feedthrough=False,
+    )
+
+    assert evaluator.evaluate({}) == 0.0
+
+    temporary_locations = {
+        "TOP.U_A0.p": (35.0, 5.0),
+        "TOP.U_A1.p": (35.0, 5.0),
+    }
+    assert evaluator.evaluate(temporary_locations) == 2.0
 
 
 def test_mcts_scaled_budget_and_tail_decay(tmp_path):
