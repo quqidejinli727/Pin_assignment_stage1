@@ -51,6 +51,10 @@ class RunConfig:
     mcts_tail_depth: int = 8
     mcts_early_stop_std_multiplier: float = 2.0
     mcts_enable_tail_early_stop: bool = True
+    mcts_basic_dynamic_simulations: bool = True
+    mcts_basic_space_scale_divisor: float = 1_000_000.0
+    mcts_basic_max_space_factor: float = 10.0
+    mcts_basic_min_simulations: int = 256
 
     def to_record(self) -> Dict[str, Any]:
         """转换为可保存到 JSON 中的参数记录。"""

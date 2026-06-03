@@ -162,6 +162,134 @@ def test_solver_supports_basic_mcts_search_mode(tmp_path):
     assert result["summary"]["unassigned_group_count"] == 0
 
 
+def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
+    """Verify Basic mode scales N_base by the capped total search-space factor."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    usage = segments.snapshot_usage()
+
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=100,
+        search_mode="basic",
+        basic_space_scale_divisor=10,
+        basic_max_space_factor=10,
+        basic_min_simulations=1,
+    )
+    assert abs(mcts._total_search_space_factor(usage) - 6.4) < 1e-9
+    assert mcts._basic_simulation_budget(usage) == 640
+
+    doubled = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=200,
+        search_mode="basic",
+        basic_space_scale_divisor=10,
+        basic_max_space_factor=10,
+        basic_min_simulations=1,
+    )
+    assert doubled._basic_simulation_budget(usage) == 1280
+
+    capped = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=100,
+        search_mode="basic",
+        basic_space_scale_divisor=1,
+        basic_max_space_factor=5,
+        basic_min_simulations=1,
+    )
+    assert capped._total_search_space_factor(usage) == 5
+    assert capped._basic_simulation_budget(usage) == 500
+
+
+def test_basic_mcts_dynamic_budget_has_floor_and_can_be_disabled(tmp_path):
+    """Small spaces can shrink below N_base but never below the configured minimum."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    usage = segments.snapshot_usage()
+
+    floored = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=100,
+        search_mode="basic",
+        basic_space_scale_divisor=1_000_000,
+        basic_min_simulations=256,
+    )
+    assert abs(floored._total_search_space_factor(usage) - 0.000064) < 1e-12
+    assert floored._basic_simulation_budget(usage) == 256
+
+    reduced = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=1000,
+        search_mode="basic",
+        basic_space_scale_divisor=1_000_000,
+        basic_min_simulations=10,
+    )
+    assert reduced._basic_simulation_budget(usage) == 10
+
+    disabled = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=17,
+        search_mode="basic",
+        basic_dynamic_simulations=False,
+    )
+    assert disabled._basic_simulation_budget(usage) == 17
+
+
+def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
+    """Basic search should run exactly the dynamic budget number of simulations."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=3,
+        search_mode="basic",
+        basic_space_scale_divisor=10,
+        basic_max_space_factor=10,
+        basic_min_simulations=1,
+    )
+    expected = mcts._basic_simulation_budget(segments.snapshot_usage())
+    calls = {"simulate": 0}
+
+    def fake_simulate(_node):
+        calls["simulate"] += 1
+        return 0.0
+
+    mcts._simulate = fake_simulate
+    mcts.search()
+
+    assert calls["simulate"] == expected
+
+
 def test_reward_evaluator_normalizes_against_centroid_reference(tmp_path):
     """Verify per-net HPWL reward is normalized against cached centroid references."""
     block_path, pingroup_path = write_case(tmp_path)

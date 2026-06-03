@@ -61,6 +61,10 @@ class MCTSSolver:
         tail_depth: int = 8,
         early_stop_std_multiplier: float = 2.0,
         enable_tail_early_stop: bool = True,
+        basic_dynamic_simulations: bool = True,
+        basic_space_scale_divisor: float = 1_000_000.0,
+        basic_max_space_factor: float = 10.0,
+        basic_min_simulations: int = 256,
         wirelength_weight: float = 1.0,
         feedthrough_weight: float = 0.0,
         reward_normalization_floor: float = 1.0,
@@ -86,6 +90,10 @@ class MCTSSolver:
         self.tail_depth = tail_depth
         self.early_stop_std_multiplier = early_stop_std_multiplier
         self.enable_tail_early_stop = enable_tail_early_stop
+        self.basic_dynamic_simulations = basic_dynamic_simulations
+        self.basic_space_scale_divisor = basic_space_scale_divisor
+        self.basic_max_space_factor = basic_max_space_factor
+        self.basic_min_simulations = basic_min_simulations
         self.reward_evaluator = RewardEvaluator(
             self.nets,
             self.placedb,
@@ -165,7 +173,7 @@ class MCTSSolver:
         if not self.groups:
             return {}
 
-        for _ in range(self.simulations):
+        for _ in range(self._basic_simulation_budget(root.usage)):
             node = self._select(root)
             if node.group_index < len(self.groups):
                 node = self._expand(node)
@@ -176,6 +184,38 @@ class MCTSSolver:
         if best is None:
             return self._greedy_assignment(root.usage)
         return self._extract_best_path(best)
+
+    def _basic_simulation_budget(self, usage: SegmentUsage) -> int:
+        """Return the actual Basic-mode simulation count for this local tree."""
+        if not self.basic_dynamic_simulations:
+            return self.simulations
+        space_factor = self._total_search_space_factor(usage)
+        scaled_budget = math.ceil(self.simulations * space_factor)
+        return max(self.basic_min_simulations, scaled_budget)
+
+    def _total_search_space_factor(self, usage: SegmentUsage) -> float:
+        """Estimate the total combinational search space as a capped scale factor."""
+        if not self.groups:
+            return 0.0
+        if self.basic_space_scale_divisor <= 0:
+            return 1.0
+
+        max_space_factor = max(1.0, self.basic_max_space_factor)
+        log_total_space = 0.0
+        for group in self.groups:
+            branch_count = sum(
+                1
+                for segment in self.segment_manager.candidates_for_module(group.module_name)
+                if usage.can_assign(segment, group.max_pin_width)
+            )
+            if branch_count <= 0:
+                return 0.0
+            log_total_space += math.log(branch_count)
+
+        log_raw_factor = log_total_space - math.log(self.basic_space_scale_divisor)
+        if log_raw_factor >= math.log(max_space_factor):
+            return max_space_factor
+        return math.exp(log_raw_factor)
 
     def _total_simulation_budget(self, usage: SegmentUsage) -> int:
         """根据搜索空间因子放大输入基准模拟次数。"""
