@@ -9,7 +9,7 @@ from typing import Dict, List, Set
 from PlaceDB import Net, Pin, PlaceDB
 from homology import HomologyManager, PinHomologyGroup
 from mcts import MCTSSolver, get_simulation_budget
-from scoring import FeedthroughContext, final_net_metrics
+from scoring import FeedthroughContext, RewardEvaluator, final_net_metrics
 from segment import SegmentManager
 from segment_subdivision import percentile_edge_length
 
@@ -66,6 +66,9 @@ class AssignmentSolver:
         self.allow_overflow_fallback = allow_overflow_fallback
         self.feedthrough_weight = feedthrough_weight
         self.enable_feedthrough = enable_feedthrough
+        self.wirelength_reward_weight = wirelength_reward_weight
+        self.reward_normalization_floor = reward_normalization_floor
+        self.reward_scale = reward_scale
         self.feedthrough_source_dir = Path(feedthrough_source_dir) if feedthrough_source_dir else None
         self.auto_build_feedthrough = auto_build_feedthrough
         self.cmake_generator = cmake_generator
@@ -260,9 +263,68 @@ class AssignmentSolver:
             self._record_assignment_issue(group, "capacity_exceeded", fallback_reason)
             return False
 
-        segment = max(feasible, key=lambda item: item.remaining_capacity)
+        segment = self._best_greedy_segment_by_reward(group, feasible)
         self._commit_group_assignment(group, segment.segment_id)
         return True
+
+    def _best_greedy_segment_by_reward(
+        self,
+        group: PinHomologyGroup,
+        feasible_segments,
+    ):
+        """Choose the feasible segment that maximizes the same weighted reward as MCTS."""
+        related_nets = self.homology.get_related_nets(group)
+        if not related_nets:
+            return max(feasible_segments, key=lambda item: item.remaining_capacity)
+
+        evaluator = RewardEvaluator(
+            related_nets,
+            self.placedb,
+            wirelength_weight=self.wirelength_reward_weight,
+            feedthrough_weight=self.feedthrough_weight,
+            enable_feedthrough=self.enable_feedthrough,
+            normalization_floor=self.reward_normalization_floor,
+            reward_scale=self.reward_scale,
+            feedthrough_context=self.feedthrough_context,
+        )
+        try:
+            best_segment = None
+            best_reward = float("-inf")
+            for segment in feasible_segments:
+                temporary_locations = self._temporary_locations_for_group(group, segment.segment_id)
+                if len(temporary_locations) != len(group.pins):
+                    continue
+                reward = evaluator.evaluate(temporary_locations)
+                if (
+                    best_segment is None
+                    or reward > best_reward
+                    or (
+                        reward == best_reward
+                        and segment.remaining_capacity > best_segment.remaining_capacity
+                    )
+                ):
+                    best_segment = segment
+                    best_reward = reward
+            if best_segment is not None:
+                return best_segment
+            return max(feasible_segments, key=lambda item: item.remaining_capacity)
+        finally:
+            evaluator.close()
+
+    def _temporary_locations_for_group(
+        self,
+        group: PinHomologyGroup,
+        segment_id: str,
+    ) -> Dict[str, tuple[float, float]]:
+        """Return temporary candidate locations for assigning one group to a segment."""
+        locations = {}
+        for pin in group.pins:
+            try:
+                instance = self.segment_manager.get_instance(pin.parent_inst, segment_id)
+            except KeyError:
+                continue
+            locations[pin.full_name] = instance.midpoint
+        return locations
 
     def _commit_group_assignment(
         self,

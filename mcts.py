@@ -195,14 +195,15 @@ class MCTSSolver:
 
     def _total_search_space_factor(self, usage: SegmentUsage) -> float:
         """Estimate the total combinational search space as a capped scale factor."""
-        if not self.groups:
+        active_groups = [group for group in self.groups if not group.assigned]
+        if not active_groups:
             return 0.0
         if self.basic_space_scale_divisor <= 0:
             return 1.0
 
         max_space_factor = max(1.0, self.basic_max_space_factor)
         log_total_space = 0.0
-        for group in self.groups:
+        for group in active_groups:
             branch_count = sum(
                 1
                 for segment in self.segment_manager.candidates_for_module(group.module_name)
@@ -225,10 +226,11 @@ class MCTSSolver:
 
     def _search_space_factor(self, usage: SegmentUsage) -> float:
         """估算搜索空间放大系数。"""
-        if not self.groups or self.space_scale_divisor <= 0:
+        active_groups = [group for group in self.groups if not group.assigned]
+        if not active_groups or self.space_scale_divisor <= 0:
             return 0.0
         branch_counts = []
-        for group in self.groups:
+        for group in active_groups:
             count = sum(
                 1
                 for segment in self.segment_manager.candidates_for_module(group.module_name)
@@ -425,7 +427,7 @@ class MCTSSolver:
         local_usage = usage.clone()
         assigned_names = set(completed)
         for group in self.groups:
-            if group.name in assigned_names:
+            if group.assigned or group.name in assigned_names:
                 continue
             feasible = [
                 segment
@@ -434,10 +436,40 @@ class MCTSSolver:
             ]
             if not feasible:
                 continue
-            segment = max(feasible, key=lambda item: item.remaining_capacity)
+            segment = self._best_completion_segment_by_reward(group, feasible, completed)
             local_usage.assign(segment, group.max_pin_width)
             completed[group.name] = segment.segment_id
         return completed
+
+    def _best_completion_segment_by_reward(
+        self,
+        group: PinHomologyGroup,
+        feasible_segments: List[AbstractSegment],
+        assignments: Dict[str, str],
+    ) -> AbstractSegment:
+        """Choose the greedy completion segment with the best current MCTS reward."""
+        best_segment = None
+        best_reward = float("-inf")
+        for segment in feasible_segments:
+            candidate_assignments = dict(assignments)
+            candidate_assignments[group.name] = segment.segment_id
+            reward = self.reward_evaluator.evaluate(
+                self._temporary_locations(candidate_assignments)
+            )
+            if (
+                best_segment is None
+                or reward > best_reward
+                or (
+                    reward == best_reward
+                    and segment.remaining_capacity > best_segment.remaining_capacity
+                )
+            ):
+                best_segment = segment
+                best_reward = reward
+        return best_segment if best_segment is not None else max(
+            feasible_segments,
+            key=lambda item: item.remaining_capacity,
+        )
 
     def _greedy_assignment(self, usage: SegmentUsage) -> Dict[str, str]:
         """在没有可用 MCTS 子节点时，直接生成贪心分配方案。"""

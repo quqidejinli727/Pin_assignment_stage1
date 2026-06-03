@@ -213,6 +213,35 @@ def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
     assert capped._basic_simulation_budget(usage) == 500
 
 
+def test_mcts_search_space_ignores_already_assigned_groups(tmp_path):
+    """Already assigned groups should not multiply estimated search space again."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    groups[0].assigned = True
+    usage = segments.snapshot_usage()
+
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=100,
+        search_mode="basic",
+        basic_space_scale_divisor=10,
+        basic_max_space_factor=10,
+        basic_min_simulations=1,
+        typical_depth=3,
+        space_scale_divisor=10,
+        max_space_factor=10,
+    )
+
+    assert abs(mcts._total_search_space_factor(usage) - 1.6) < 1e-9
+    assert mcts._search_space_factor(usage) == 6.4
+
+
 def test_basic_mcts_dynamic_budget_has_floor_and_can_be_disabled(tmp_path):
     """Small spaces can shrink below N_base but never below the configured minimum."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -288,6 +317,42 @@ def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
     mcts.search()
 
     assert calls["simulate"] == expected
+
+
+def test_assignment_greedy_selects_reward_best_feasible_segment(tmp_path):
+    """Fallback greedy assignment should prefer reward over remaining capacity."""
+    block_path, pingroup_path = write_case(tmp_path)
+    solver = AssignmentSolver(str(block_path), str(pingroup_path), simulations=1)
+    group = solver.homology.pin_groups["A.p"]
+    candidates = solver.segment_manager.candidates_for_module(group.module_name)[:2]
+    preferred = candidates[1]
+    candidates[0].used_width = 0.0
+    preferred.used_width = preferred.capacity - 2.0
+
+    class FakeEvaluator:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def evaluate(self, temporary_locations):
+            return (
+                100.0
+                if any(point == preferred.instances[pin.parent_inst].midpoint for pin, point in [
+                    (group.pins[0], temporary_locations[group.pins[0].full_name])
+                ])
+                else 0.0
+            )
+
+        def close(self):
+            pass
+
+    original_evaluator = assignment_solver_module.RewardEvaluator
+    assignment_solver_module.RewardEvaluator = FakeEvaluator
+    try:
+        chosen = solver._best_greedy_segment_by_reward(group, candidates)
+    finally:
+        assignment_solver_module.RewardEvaluator = original_evaluator
+
+    assert chosen is preferred
 
 
 def test_reward_evaluator_normalizes_against_centroid_reference(tmp_path):
