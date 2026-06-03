@@ -146,6 +146,20 @@ def test_solver_assigns_all_pins_and_respects_capacity(tmp_path):
     assert sorted(assigned_pin_names) == sorted(solver.placedb.pin_dict)
 
 
+def test_solver_supports_basic_mcts_search_mode(tmp_path):
+    """验证 config 可切换到基础版 MCTS 搜索流程。"""
+    block_path, pingroup_path = write_case(tmp_path)
+    solver = AssignmentSolver(
+        str(block_path),
+        str(pingroup_path),
+        simulations=32,
+        mcts_search_mode="basic",
+    )
+    result = solver.solve()
+    assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
+    assert result["summary"]["unassigned_group_count"] == 0
+
+
 def test_mcts_scaled_budget_and_tail_decay(tmp_path):
     """验证新 MCTS 搜索预算公式和长尾衰减。"""
     block_path, pingroup_path = write_case(tmp_path)

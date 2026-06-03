@@ -38,6 +38,7 @@ class RunConfig:
     enable_segment_subdivision: bool = True
     segment_length_percentile: int = 50
     export_interface_result: bool = True
+    mcts_search_mode: str = "layered"
     mcts_budget_decay: float = 0.6
     mcts_tail_decay: float = 0.9
     mcts_typical_depth: int = 6

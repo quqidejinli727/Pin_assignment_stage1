@@ -25,6 +25,7 @@ class AssignmentSolver:
         allow_overflow_fallback: bool = True,
         enable_segment_subdivision: bool = True,
         segment_length_percentile: int = 50,
+        mcts_search_mode: str = "layered",
         mcts_budget_decay: float = 0.6,
         mcts_tail_decay: float = 0.9,
         mcts_typical_depth: int = 6,
@@ -51,6 +52,7 @@ class AssignmentSolver:
         self.random_seed = random_seed
         self.allow_overflow_fallback = allow_overflow_fallback
         self.mcts_options = {
+            "search_mode": mcts_search_mode,
             "budget_decay": mcts_budget_decay,
             "tail_decay": mcts_tail_decay,
             "typical_depth": mcts_typical_depth,

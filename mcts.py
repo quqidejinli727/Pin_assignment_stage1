@@ -51,6 +51,7 @@ class MCTSSolver:
         simulations: int = 128,
         exploration_constant: float = 1.414,
         random_seed: int = 7,
+        search_mode: str = "layered",
         budget_decay: float = 0.6,
         tail_decay: float = 0.9,
         typical_depth: int = 6,
@@ -69,6 +70,7 @@ class MCTSSolver:
         self.simulations = simulations
         self.exploration_constant = exploration_constant
         self.random = random.Random(random_seed)
+        self.search_mode = search_mode
         self.budget_decay = budget_decay
         self.tail_decay = tail_decay
         self.typical_depth = typical_depth
@@ -80,6 +82,17 @@ class MCTSSolver:
         self.enable_tail_early_stop = enable_tail_early_stop
 
     def search(self) -> Dict[str, str]:
+        """执行已配置的 MCTS 搜索策略。"""
+        if self.search_mode == "basic":
+            return self._search_basic()
+        if self.search_mode == "layered":
+            return self._search_layered()
+        raise ValueError(
+            f"Unsupported MCTS search mode: {self.search_mode!r}. "
+            "Use 'layered' or 'basic'."
+        )
+
+    def _search_layered(self) -> Dict[str, str]:
         """逐层执行 MCTS 搜索，并返回同构组到抽象 segment 的分配方案。"""
         root = MCTSNode(
             group_index=0,
@@ -121,6 +134,29 @@ class MCTSSolver:
         if len(current.assignments) < len(self.groups):
             return self._complete_greedily(current.assignments, current.usage)
         return current.assignments
+
+    def _search_basic(self) -> Dict[str, str]:
+        """执行基础版 MCTS：固定模拟次数后直接抽取当前树最佳路径。"""
+        root = MCTSNode(
+            group_index=0,
+            usage=self.segment_manager.snapshot_usage(),
+            assignments={},
+        )
+
+        if not self.groups:
+            return {}
+
+        for _ in range(self.simulations):
+            node = self._select(root)
+            if node.group_index < len(self.groups):
+                node = self._expand(node)
+            reward = self._simulate(node)
+            self._backpropagate(node, reward)
+
+        best = self._best_child_by_reward(root)
+        if best is None:
+            return self._greedy_assignment(root.usage)
+        return self._extract_best_path(best)
 
     def _total_simulation_budget(self, usage: SegmentUsage) -> int:
         """根据搜索空间因子放大输入基准模拟次数。"""

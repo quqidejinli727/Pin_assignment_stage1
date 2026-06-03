@@ -133,6 +133,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         allow_overflow_fallback=config.allow_overflow_fallback,
         enable_segment_subdivision=config.enable_segment_subdivision,
         segment_length_percentile=config.segment_length_percentile,
+        mcts_search_mode=config.mcts_search_mode,
         mcts_budget_decay=config.mcts_budget_decay,
         mcts_tail_decay=config.mcts_tail_decay,
         mcts_typical_depth=config.mcts_typical_depth,
