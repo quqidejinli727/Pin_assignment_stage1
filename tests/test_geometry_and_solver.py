@@ -1,11 +1,12 @@
 import json
 from pathlib import Path
 
+import assignment_solver as assignment_solver_module
 from assignment_solver import AssignmentSolver
 from geometry_utils import align_vertices_to_reference
 from homology import HomologyManager
 from mcts import MCTSNode, MCTSSolver
-from scoring import RewardEvaluator
+from scoring import RewardEvaluator, final_net_metrics
 from segment import SegmentManager
 from PlaceDB import PlaceDB
 
@@ -190,6 +191,193 @@ def test_reward_evaluator_normalizes_against_centroid_reference(tmp_path):
         reward_scale=10.0,
     )
     assert scaled_evaluator.evaluate(temporary_locations) == 20.0
+
+
+class FakeFeedthroughContext:
+    """Small test double that records feedthrough calls without starting ftpred."""
+
+    def __init__(self):
+        self.calls = []
+        self.closed = False
+
+    def run_one_net_at_locations(self, net, locations):
+        self.calls.append((net.net_id, tuple(sorted(locations))))
+        return 0.0
+
+    def close(self):
+        self.closed = True
+
+
+def test_reward_evaluator_uses_shared_feedthrough_context(tmp_path):
+    """Feedthrough references and candidates must call the injected context."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    context = FakeFeedthroughContext()
+
+    evaluator = RewardEvaluator(
+        placedb.nets_list,
+        placedb,
+        feedthrough_weight=1.0,
+        enable_feedthrough=True,
+        feedthrough_context=context,
+    )
+    reference_call_count = len(context.calls)
+    evaluator.evaluate({"TOP.U_A0.p": (35.0, 5.0)})
+
+    assert reference_call_count == len(placedb.nets_list)
+    assert len(context.calls) == reference_call_count + len(placedb.nets_list)
+    assert not context.closed
+
+
+def test_mcts_solvers_share_one_feedthrough_context(tmp_path):
+    """Multiple local MCTS solvers can reuse one feedthrough context."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    context = FakeFeedthroughContext()
+
+    for seed in [1, 2]:
+        mcts = MCTSSolver(
+            placedb,
+            segments,
+            groups,
+            placedb.nets_list,
+            simulations=1,
+            random_seed=seed,
+            search_mode="basic",
+            feedthrough_weight=1.0,
+            enable_feedthrough=True,
+            feedthrough_context=context,
+        )
+        mcts.search()
+
+    assert len(context.calls) > 0
+    assert not context.closed
+
+
+def test_assignment_solver_creates_one_feedthrough_context(tmp_path):
+    """A full solve should create one shared FT context and close it explicitly."""
+    block_path, pingroup_path = write_case(tmp_path)
+    created_contexts = []
+
+    class FakeContext(FakeFeedthroughContext):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            created_contexts.append(self)
+
+    original_context = assignment_solver_module.FeedthroughContext
+    assignment_solver_module.FeedthroughContext = FakeContext
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            mcts_search_mode="basic",
+            feedthrough_weight=1.0,
+            feedthrough_source_dir=tmp_path,
+            enable_feedthrough=True,
+        )
+        result = solver.solve()
+        metrics = solver.final_net_metrics(tmp_path, enable_feedthrough=True)
+        solver.close_feedthrough_context()
+    finally:
+        assignment_solver_module.FeedthroughContext = original_context
+
+    assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
+    assert len(created_contexts) == 1
+    assert created_contexts[0].closed
+    assert len(metrics) == len(solver.placedb.nets_list)
+
+
+def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):
+    """No shared FT context should be opened when feedthrough reward weight is zero."""
+    block_path, pingroup_path = write_case(tmp_path)
+
+    class FailingContext:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("feedthrough context should not be created")
+
+    original_context = assignment_solver_module.FeedthroughContext
+    assignment_solver_module.FeedthroughContext = FailingContext
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            feedthrough_weight=0.0,
+            feedthrough_source_dir=tmp_path,
+            enable_feedthrough=True,
+        )
+        result = solver.solve()
+    finally:
+        assignment_solver_module.FeedthroughContext = original_context
+
+    assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
+
+
+def test_assignment_solver_closes_context_on_mcts_failure(tmp_path):
+    """The shared FT context must be closed when local MCTS search raises."""
+    block_path, pingroup_path = write_case(tmp_path)
+    created_contexts = []
+
+    class FakeContext(FakeFeedthroughContext):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            created_contexts.append(self)
+
+    class FailingMCTS:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def search(self):
+            raise RuntimeError("forced mcts failure")
+
+    original_context = assignment_solver_module.FeedthroughContext
+    original_mcts = assignment_solver_module.MCTSSolver
+    assignment_solver_module.FeedthroughContext = FakeContext
+    assignment_solver_module.MCTSSolver = FailingMCTS
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            feedthrough_weight=1.0,
+            feedthrough_source_dir=tmp_path,
+            enable_feedthrough=True,
+        )
+        try:
+            solver.solve()
+        except RuntimeError as exc:
+            assert str(exc) == "forced mcts failure"
+        else:
+            raise AssertionError("solver should have raised")
+    finally:
+        assignment_solver_module.FeedthroughContext = original_context
+        assignment_solver_module.MCTSSolver = original_mcts
+
+    assert len(created_contexts) == 1
+    assert created_contexts[0].closed
+
+
+def test_final_net_metrics_can_reuse_feedthrough_context(tmp_path):
+    """Final metrics should not require a new predictor when context is provided."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    context = FakeFeedthroughContext()
+
+    metrics = final_net_metrics(
+        placedb,
+        tmp_path,
+        enable_feedthrough=True,
+        auto_build_feedthrough=False,
+        feedthrough_context=context,
+    )
+
+    assert len(metrics) == len(placedb.nets_list)
+    assert len(context.calls) == len(placedb.nets_list)
+    assert not context.closed
 
 
 def test_mcts_scaled_budget_and_tail_decay(tmp_path):

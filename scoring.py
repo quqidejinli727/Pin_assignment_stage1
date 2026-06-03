@@ -45,6 +45,51 @@ class NetReferenceMetrics:
     feedthrough: float = 0.0
 
 
+class FeedthroughContext:
+    """Own one long-lived feedthrough predictor session for a full Stage 1 run."""
+
+    def __init__(
+        self,
+        placedb: PlaceDB,
+        feedthrough_source_dir: Path,
+        *,
+        auto_build_feedthrough: bool = True,
+        cmake_generator: str | None = None,
+    ):
+        self.placedb = placedb
+        executable = ensure_ftpred_executable(
+            feedthrough_source_dir,
+            auto_build=auto_build_feedthrough,
+            cmake_generator=cmake_generator,
+        )
+        modules_text = ftpred_loader.build_modules_text(placedb)
+        self.session = ftpred_loader.FtpredBinSession(str(executable), modules_text)
+
+    def close(self) -> None:
+        """Close the long-lived predictor session."""
+        if self.session is not None:
+            self.session.close()
+            self.session = None
+
+    def run_one_net_at_locations(self, net: Net, locations: Dict[str, Point]) -> float:
+        """Evaluate one net after temporarily applying the given pin locations."""
+        if self.session is None:
+            raise RuntimeError("FeedthroughContext has already been closed.")
+
+        old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
+        old_net_feedthrough = getattr(net, "feedthrough", 0.0)
+        try:
+            for pin in net.pins:
+                pin.x, pin.y = locations[pin.full_name]
+            with redirect_stdout(StringIO()):
+                return float(self.session.run_one_net(self.placedb, net))
+        finally:
+            for pin, x, y in old_pin_locations:
+                pin.x = x
+                pin.y = y
+            net.feedthrough = old_net_feedthrough
+
+
 class RewardEvaluator:
     """Evaluate MCTS rewards with per-net reference normalization."""
 
@@ -55,12 +100,10 @@ class RewardEvaluator:
         *,
         wirelength_weight: float = 1.0,
         feedthrough_weight: float = 0.0,
-        feedthrough_source_dir: Path | None = None,
         enable_feedthrough: bool = True,
-        auto_build_feedthrough: bool = True,
-        cmake_generator: str | None = None,
         normalization_floor: float = 1.0,
         reward_scale: float = 1.0,
+        feedthrough_context: FeedthroughContext | None = None,
     ):
         self.nets = list(nets)
         self.placedb = placedb
@@ -69,19 +112,11 @@ class RewardEvaluator:
         self.enable_feedthrough = enable_feedthrough and feedthrough_weight != 0.0
         self.normalization_floor = normalization_floor
         self.reward_scale = reward_scale
-        self._session = None
+        self.feedthrough_context = feedthrough_context
         self._candidate_feedthrough_cache: Dict[Tuple[int, Tuple[Point, ...]], float] = {}
 
-        if self.enable_feedthrough:
-            if feedthrough_source_dir is None:
-                raise ValueError("feedthrough_source_dir is required when feedthrough reward is enabled.")
-            executable = ensure_ftpred_executable(
-                feedthrough_source_dir,
-                auto_build=auto_build_feedthrough,
-                cmake_generator=cmake_generator,
-            )
-            modules_text = ftpred_loader.build_modules_text(placedb)
-            self._session = ftpred_loader.FtpredBinSession(str(executable), modules_text)
+        if self.enable_feedthrough and self.feedthrough_context is None:
+            raise ValueError("feedthrough_context is required when feedthrough reward is enabled.")
 
         self.reference_metrics = {
             id(net): self._build_reference_metrics(net)
@@ -89,10 +124,8 @@ class RewardEvaluator:
         }
 
     def close(self) -> None:
-        """Close the optional feedthrough predictor session."""
-        if self._session is not None:
-            self._session.close()
-            self._session = None
+        """Release local evaluator caches without closing the shared predictor."""
+        self._candidate_feedthrough_cache.clear()
 
     def evaluate(self, temporary_locations: Dict[str, Point]) -> float:
         """Return weighted normalized reward for a complete candidate assignment."""
@@ -147,21 +180,9 @@ class RewardEvaluator:
         return self._candidate_feedthrough_cache[key]
 
     def _feedthrough_at_locations(self, net: Net, locations: Dict[str, Point]) -> float:
-        if self._session is None:
+        if self.feedthrough_context is None:
             return 0.0
-
-        old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
-        old_net_feedthrough = getattr(net, "feedthrough", 0.0)
-        try:
-            for pin in net.pins:
-                pin.x, pin.y = locations[pin.full_name]
-            with redirect_stdout(StringIO()):
-                return float(self._session.run_one_net(self.placedb, net))
-        finally:
-            for pin, x, y in old_pin_locations:
-                pin.x = x
-                pin.y = y
-            net.feedthrough = old_net_feedthrough
+        return self.feedthrough_context.run_one_net_at_locations(net, locations)
 
     def _normalized_improvement(self, reference: float, candidate: float) -> float:
         denominator = max(abs(reference), self.normalization_floor)
@@ -266,6 +287,7 @@ def final_net_metrics(
     enable_feedthrough: bool = True,
     auto_build_feedthrough: bool = True,
     cmake_generator: str | None = None,
+    feedthrough_context: FeedthroughContext | None = None,
 ) -> List[NetMetrics]:
     """计算最终分配后所有 net 的 HPWL 与 feedthrough。
 
@@ -281,6 +303,15 @@ def final_net_metrics(
         for net in placedb.nets_list
     ]
     if not enable_feedthrough:
+        return metrics
+
+    if feedthrough_context is not None:
+        for metric, net in zip(metrics, placedb.nets_list):
+            locations = {
+                pin.full_name: placedb.get_pin_location_estimate(pin)
+                for pin in net.pins
+            }
+            metric.feedthrough = float(feedthrough_context.run_one_net_at_locations(net, locations))
         return metrics
 
     executable = ensure_ftpred_executable(

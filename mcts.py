@@ -5,13 +5,12 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from PlaceDB import Net, PlaceDB
 from geometry_utils import Point
 from homology import PinHomologyGroup
-from scoring import RewardEvaluator
+from scoring import FeedthroughContext, RewardEvaluator
 from segment import AbstractSegment, SegmentManager, SegmentUsage
 
 
@@ -66,10 +65,8 @@ class MCTSSolver:
         feedthrough_weight: float = 0.0,
         reward_normalization_floor: float = 1.0,
         reward_scale: float = 1.0,
-        feedthrough_source_dir: Path | None = None,
         enable_feedthrough: bool = True,
-        auto_build_feedthrough: bool = True,
-        cmake_generator: str | None = None,
+        feedthrough_context: FeedthroughContext | None = None,
     ):
         """初始化 MCTS 搜索所需的数据、参数和随机数种子。"""
         self.placedb = placedb
@@ -94,12 +91,10 @@ class MCTSSolver:
             self.placedb,
             wirelength_weight=wirelength_weight,
             feedthrough_weight=feedthrough_weight,
-            feedthrough_source_dir=feedthrough_source_dir,
             enable_feedthrough=enable_feedthrough,
-            auto_build_feedthrough=auto_build_feedthrough,
-            cmake_generator=cmake_generator,
             normalization_floor=reward_normalization_floor,
             reward_scale=reward_scale,
+            feedthrough_context=feedthrough_context,
         )
 
     def search(self) -> Dict[str, str]:

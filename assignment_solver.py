@@ -9,6 +9,7 @@ from typing import Dict, List, Set
 from PlaceDB import Net, Pin, PlaceDB
 from homology import HomologyManager, PinHomologyGroup
 from mcts import MCTSSolver, get_simulation_budget
+from scoring import FeedthroughContext, final_net_metrics
 from segment import SegmentManager
 from segment_subdivision import percentile_edge_length
 
@@ -59,6 +60,12 @@ class AssignmentSolver:
         self.simulations = simulations
         self.random_seed = random_seed
         self.allow_overflow_fallback = allow_overflow_fallback
+        self.feedthrough_weight = feedthrough_weight
+        self.enable_feedthrough = enable_feedthrough
+        self.feedthrough_source_dir = Path(feedthrough_source_dir) if feedthrough_source_dir else None
+        self.auto_build_feedthrough = auto_build_feedthrough
+        self.cmake_generator = cmake_generator
+        self.feedthrough_context: FeedthroughContext | None = None
         self.mcts_options = {
             "search_mode": mcts_search_mode,
             "budget_decay": mcts_budget_decay,
@@ -74,10 +81,7 @@ class AssignmentSolver:
             "feedthrough_weight": feedthrough_weight,
             "reward_normalization_floor": reward_normalization_floor,
             "reward_scale": reward_scale,
-            "feedthrough_source_dir": Path(feedthrough_source_dir) if feedthrough_source_dir else None,
             "enable_feedthrough": enable_feedthrough,
-            "auto_build_feedthrough": auto_build_feedthrough,
-            "cmake_generator": cmake_generator,
         }
         self.assignment_rounds = 0
         self.assignment_progress_index = 0
@@ -85,6 +89,15 @@ class AssignmentSolver:
 
     def solve(self) -> Dict[str, object]:
         """执行完整分配流程，并返回最终输出数据结构。"""
+        self._open_feedthrough_context_if_needed()
+        try:
+            return self._solve_with_open_context()
+        except Exception:
+            self.close_feedthrough_context()
+            raise
+
+    def _solve_with_open_context(self) -> Dict[str, object]:
+        """Run assignment while keeping the optional feedthrough context open."""
         for seed_group in self.homology.unassigned_groups():
             if seed_group.assigned:
                 continue
@@ -115,6 +128,7 @@ class AssignmentSolver:
                 nets=nets,
                 simulations=budget,
                 random_seed=self.random_seed + self.assignment_rounds,
+                feedthrough_context=self.feedthrough_context,
                 **self.mcts_options,
             )
             proposed_assignment = mcts.search()
@@ -123,6 +137,44 @@ class AssignmentSolver:
 
         self._finalize_unassigned_groups()
         return self.build_output()
+
+    def _open_feedthrough_context_if_needed(self) -> None:
+        """Open one shared feedthrough context for the full solve when reward needs it."""
+        if self.feedthrough_context is not None:
+            return
+        if not self.enable_feedthrough or self.feedthrough_weight == 0.0:
+            return
+        if self.feedthrough_source_dir is None:
+            raise ValueError("feedthrough_source_dir is required when feedthrough reward is enabled.")
+        self.feedthrough_context = FeedthroughContext(
+            self.placedb,
+            self.feedthrough_source_dir,
+            auto_build_feedthrough=self.auto_build_feedthrough,
+            cmake_generator=self.cmake_generator,
+        )
+
+    def close_feedthrough_context(self) -> None:
+        """Close the shared feedthrough context if it is open."""
+        if self.feedthrough_context is not None:
+            self.feedthrough_context.close()
+            self.feedthrough_context = None
+
+    def final_net_metrics(
+        self,
+        feedthrough_source_dir: str | Path,
+        enable_feedthrough: bool = True,
+        auto_build_feedthrough: bool = True,
+        cmake_generator: str | None = None,
+    ):
+        """Compute final metrics, reusing the shared feedthrough context when available."""
+        return final_net_metrics(
+            self.placedb,
+            Path(feedthrough_source_dir),
+            enable_feedthrough=enable_feedthrough,
+            auto_build_feedthrough=auto_build_feedthrough,
+            cmake_generator=cmake_generator,
+            feedthrough_context=self.feedthrough_context,
+        )
 
     def _collect_pins(self, nets: List[Net]) -> List[Pin]:
         """从一批 Net 中收集去重后的 pins_in。"""
@@ -284,8 +336,11 @@ class AssignmentSolver:
 
     def write_output(self, output_path: str) -> Dict[str, object]:
         """运行求解并把输出 JSON 写到指定路径。"""
-        result = self.solve()
-        path = Path(output_path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-        return result
+        try:
+            result = self.solve()
+            path = Path(output_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+            return result
+        finally:
+            self.close_feedthrough_context()

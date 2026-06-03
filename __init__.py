@@ -61,7 +61,7 @@ def run_mcts(
     from assignment_solver import AssignmentSolver
     from config import DEFAULT_CONFIG
     from export_final_result import write_interface_result
-    from scoring import final_net_metrics, summarize_metrics
+    from scoring import summarize_metrics
 
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
@@ -108,34 +108,36 @@ def run_mcts(
         auto_build_feedthrough=config.auto_build_feedthrough,
         cmake_generator=config.cmake_generator if os.name == "nt" else None,
     )
-    assignment_result = solver.solve()
-    config.assignment_output_path.write_text(
-        json.dumps(assignment_result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    metrics = final_net_metrics(
-        solver.placedb,
-        feedthrough_source_dir=config.feedthrough_source_dir,
-        enable_feedthrough=config.enable_feedthrough,
-        auto_build_feedthrough=config.auto_build_feedthrough,
-        cmake_generator=config.cmake_generator if os.name == "nt" else None,
-    )
-    summary = summarize_metrics(metrics)
-    print(
-        "Stage 1 metrics: "
-        f"total_hpwl={summary['total_hpwl']:.6f}, "
-        f"total_feedthrough={summary['total_feedthrough']:.6f}"
-    )
-    logger.info(
-        "Stage 1 metrics: total_hpwl=%.6f, total_feedthrough=%.6f",
-        summary["total_hpwl"],
-        summary["total_feedthrough"],
-    )
-    return str(
-        write_interface_result(
-            output_path,
-            solver.placedb,
-            solver.homology,
-            solver.segment_manager,
+    try:
+        assignment_result = solver.solve()
+        config.assignment_output_path.write_text(
+            json.dumps(assignment_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-    )
+        metrics = solver.final_net_metrics(
+            feedthrough_source_dir=config.feedthrough_source_dir,
+            enable_feedthrough=config.enable_feedthrough,
+            auto_build_feedthrough=config.auto_build_feedthrough,
+            cmake_generator=config.cmake_generator if os.name == "nt" else None,
+        )
+        summary = summarize_metrics(metrics)
+        print(
+            "Stage 1 metrics: "
+            f"total_hpwl={summary['total_hpwl']:.6f}, "
+            f"total_feedthrough={summary['total_feedthrough']:.6f}"
+        )
+        logger.info(
+            "Stage 1 metrics: total_hpwl=%.6f, total_feedthrough=%.6f",
+            summary["total_hpwl"],
+            summary["total_feedthrough"],
+        )
+        return str(
+            write_interface_result(
+                output_path,
+                solver.placedb,
+                solver.homology,
+                solver.segment_manager,
+            )
+        )
+    finally:
+        solver.close_feedthrough_context()

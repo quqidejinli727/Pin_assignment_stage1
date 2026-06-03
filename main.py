@@ -11,7 +11,7 @@ from pathlib import Path
 from assignment_solver import AssignmentSolver
 from config import DEFAULT_CONFIG, RunConfig
 from export_final_result import write_interface_result
-from scoring import final_net_metrics, metrics_to_records, summarize_metrics
+from scoring import metrics_to_records, summarize_metrics
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,36 +152,38 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         auto_build_feedthrough=config.auto_build_feedthrough,
         cmake_generator=config.cmake_generator,
     )
-    assignment_result = solver.solve()
-    config.assignment_output_path.parent.mkdir(parents=True, exist_ok=True)
-    config.assignment_output_path.write_text(
-        json.dumps(assignment_result, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-    metrics = final_net_metrics(
-        solver.placedb,
-        feedthrough_source_dir=config.feedthrough_source_dir,
-        enable_feedthrough=config.enable_feedthrough,
-        auto_build_feedthrough=config.auto_build_feedthrough,
-        cmake_generator=config.cmake_generator,
-    )
-    report_path = write_run_report(config, assignment_result["summary"], metrics)
-    interface_result_path = None
-    if config.export_interface_result:
-        interface_result_path = write_interface_result(
-            config.interface_result_dir,
-            solver.placedb,
-            solver.homology,
-            solver.segment_manager,
+    try:
+        assignment_result = solver.solve()
+        config.assignment_output_path.parent.mkdir(parents=True, exist_ok=True)
+        config.assignment_output_path.write_text(
+            json.dumps(assignment_result, ensure_ascii=False, indent=2),
+            encoding="utf-8",
         )
-    print(json.dumps(assignment_result["summary"], ensure_ascii=False, indent=2))
-    print(json.dumps(summarize_metrics(metrics), ensure_ascii=False, indent=2))
-    print(f"Assignment output: {config.assignment_output_path}")
-    print(f"Result report: {report_path}")
-    if interface_result_path is not None:
-        print(f"Interface result: {interface_result_path}")
-        return interface_result_path
-    return config.assignment_output_path
+        metrics = solver.final_net_metrics(
+            feedthrough_source_dir=config.feedthrough_source_dir,
+            enable_feedthrough=config.enable_feedthrough,
+            auto_build_feedthrough=config.auto_build_feedthrough,
+            cmake_generator=config.cmake_generator,
+        )
+        report_path = write_run_report(config, assignment_result["summary"], metrics)
+        interface_result_path = None
+        if config.export_interface_result:
+            interface_result_path = write_interface_result(
+                config.interface_result_dir,
+                solver.placedb,
+                solver.homology,
+                solver.segment_manager,
+            )
+        print(json.dumps(assignment_result["summary"], ensure_ascii=False, indent=2))
+        print(json.dumps(summarize_metrics(metrics), ensure_ascii=False, indent=2))
+        print(f"Assignment output: {config.assignment_output_path}")
+        print(f"Result report: {report_path}")
+        if interface_result_path is not None:
+            print(f"Interface result: {interface_result_path}")
+            return interface_result_path
+        return config.assignment_output_path
+    finally:
+        solver.close_feedthrough_context()
 
 
 if __name__ == "__main__":
