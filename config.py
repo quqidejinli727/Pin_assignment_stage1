@@ -37,6 +37,7 @@ class RunConfig:
     wirelength_reward_weight: float = 1.0
     feedthrough_weight: float = 0.0
     reward_normalization_floor: float = 1.0
+    reward_scale: float = 100.0
     enable_segment_subdivision: bool = True
     segment_length_percentile: int = 50
     export_interface_result: bool = True

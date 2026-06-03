@@ -181,6 +181,16 @@ def test_reward_evaluator_normalizes_against_centroid_reference(tmp_path):
     }
     assert evaluator.evaluate(temporary_locations) == 2.0
 
+    scaled_evaluator = RewardEvaluator(
+        placedb.nets_list,
+        placedb,
+        wirelength_weight=1.0,
+        feedthrough_weight=0.0,
+        enable_feedthrough=False,
+        reward_scale=10.0,
+    )
+    assert scaled_evaluator.evaluate(temporary_locations) == 20.0
+
 
 def test_mcts_scaled_budget_and_tail_decay(tmp_path):
     """验证新 MCTS 搜索预算公式和长尾衰减。"""

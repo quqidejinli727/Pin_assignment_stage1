@@ -60,6 +60,7 @@ class RewardEvaluator:
         auto_build_feedthrough: bool = True,
         cmake_generator: str | None = None,
         normalization_floor: float = 1.0,
+        reward_scale: float = 1.0,
     ):
         self.nets = list(nets)
         self.placedb = placedb
@@ -67,6 +68,7 @@ class RewardEvaluator:
         self.feedthrough_weight = feedthrough_weight
         self.enable_feedthrough = enable_feedthrough and feedthrough_weight != 0.0
         self.normalization_floor = normalization_floor
+        self.reward_scale = reward_scale
         self._session = None
         self._candidate_feedthrough_cache: Dict[Tuple[int, Tuple[Point, ...]], float] = {}
 
@@ -112,7 +114,7 @@ class RewardEvaluator:
                 self.wirelength_weight * wirelength_reward
                 + self.feedthrough_weight * feedthrough_reward_value
             )
-        return total_reward
+        return total_reward * self.reward_scale
 
     def _build_reference_metrics(self, net: Net) -> NetReferenceMetrics:
         reference_locations = {

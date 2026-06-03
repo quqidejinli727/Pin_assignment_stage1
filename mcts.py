@@ -65,6 +65,7 @@ class MCTSSolver:
         wirelength_weight: float = 1.0,
         feedthrough_weight: float = 0.0,
         reward_normalization_floor: float = 1.0,
+        reward_scale: float = 1.0,
         feedthrough_source_dir: Path | None = None,
         enable_feedthrough: bool = True,
         auto_build_feedthrough: bool = True,
@@ -98,6 +99,7 @@ class MCTSSolver:
             auto_build_feedthrough=auto_build_feedthrough,
             cmake_generator=cmake_generator,
             normalization_floor=reward_normalization_floor,
+            reward_scale=reward_scale,
         )
 
     def search(self) -> Dict[str, str]:

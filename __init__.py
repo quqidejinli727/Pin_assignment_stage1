@@ -102,6 +102,7 @@ def run_mcts(
         wirelength_reward_weight=config.wirelength_reward_weight,
         feedthrough_weight=config.feedthrough_weight,
         reward_normalization_floor=config.reward_normalization_floor,
+        reward_scale=config.reward_scale,
         feedthrough_source_dir=config.feedthrough_source_dir,
         enable_feedthrough=config.enable_feedthrough,
         auto_build_feedthrough=config.auto_build_feedthrough,
