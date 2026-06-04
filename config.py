@@ -42,8 +42,8 @@ class RunConfig:
     allow_overflow_fallback: bool = True
     # 最终指标和非零 feedthrough reward 是否启用 feedthrough 预测器。
     enable_feedthrough: bool = True
-    # 找不到 ftpred 可执行文件时是否自动调用 CMake 编译。
-    auto_build_feedthrough: bool = True
+    # 找不到 ftpred 可执行文件时是否自动调用 CMake 编译；默认关闭，要求预先编译好。
+    auto_build_feedthrough: bool = False
     # Windows 下 CMake 使用的 generator；Linux/外部入口可传 None。
     cmake_generator: str = "MinGW Makefiles"
     # reward 中归一化 HPWL improvement 的权重。

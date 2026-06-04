@@ -53,7 +53,7 @@ class FeedthroughContext:
         placedb: PlaceDB,
         feedthrough_source_dir: Path,
         *,
-        auto_build_feedthrough: bool = True,
+        auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
     ):
         self.placedb = placedb
@@ -240,10 +240,10 @@ def _cmake_executable() -> str:
 
 def ensure_ftpred_executable(
     source_dir: Path,
-    auto_build: bool = True,
+    auto_build: bool = False,
     cmake_generator: str | None = None,
 ) -> Path:
-    """查找预测器可执行文件；不存在时仅首次按需调用 CMake 编译。"""
+    """查找预测器可执行文件；默认不编译，显式 auto_build=True 时才调用 CMake。"""
     for candidate in _predictor_candidates(source_dir):
         if candidate.exists():
             return candidate
@@ -285,7 +285,7 @@ def final_net_metrics(
     placedb: PlaceDB,
     feedthrough_source_dir: Path,
     enable_feedthrough: bool = True,
-    auto_build_feedthrough: bool = True,
+    auto_build_feedthrough: bool = False,
     cmake_generator: str | None = None,
     feedthrough_context: FeedthroughContext | None = None,
 ) -> List[NetMetrics]:

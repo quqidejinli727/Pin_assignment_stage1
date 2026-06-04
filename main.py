@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--no-auto-build",
         action="store_true",
-        help="Require a compiled predictor instead of compiling it automatically.",
+        help="Require a compiled predictor; kept for compatibility because this is now the default.",
     )
     parser.add_argument(
         "--disable-subdivision",

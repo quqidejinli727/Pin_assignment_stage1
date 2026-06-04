@@ -46,7 +46,7 @@ class AssignmentSolver:
         reward_scale: float = 1.0,
         feedthrough_source_dir: str | Path | None = None,
         enable_feedthrough: bool = True,
-        auto_build_feedthrough: bool = True,
+        auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
     ):
         """初始化数据库、同构管理器、segment 管理器和求解参数。"""
@@ -174,7 +174,7 @@ class AssignmentSolver:
         self,
         feedthrough_source_dir: str | Path,
         enable_feedthrough: bool = True,
-        auto_build_feedthrough: bool = True,
+        auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
     ):
         """Compute final metrics, reusing the shared feedthrough context when available."""
