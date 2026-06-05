@@ -6,14 +6,16 @@ import os
 import shutil
 import subprocess
 import sys
+import hashlib
+import importlib.util
 from contextlib import redirect_stdout
 from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
+from types import ModuleType
 from typing import Dict, Iterable, List, Tuple
 
 from PlaceDB import Net, PlaceDB
-from feedthrough import ftpred_loader
 from geometry_utils import Point, hpwl
 
 
@@ -55,6 +57,7 @@ class FeedthroughContext:
         *,
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
+        role: str = "feedthrough",
     ):
         self.placedb = placedb
         executable = ensure_ftpred_executable(
@@ -62,8 +65,11 @@ class FeedthroughContext:
             auto_build=auto_build_feedthrough,
             cmake_generator=cmake_generator,
         )
-        modules_text = ftpred_loader.build_modules_text(placedb)
-        self.session = ftpred_loader.FtpredBinSession(str(executable), modules_text)
+        self.role = role
+        self.executable = executable
+        self.ftpred_loader = load_ftpred_loader(feedthrough_source_dir, role)
+        modules_text = self.ftpred_loader.build_modules_text(placedb)
+        self.session = self.ftpred_loader.FtpredBinSession(str(executable), modules_text)
 
     def close(self) -> None:
         """Close the long-lived predictor session."""
@@ -218,13 +224,85 @@ class NetMetrics:
     feedthrough: float
 
 
-def _predictor_candidates(source_dir: Path) -> List[Path]:
-    """返回不同平台和 CMake generator 可能生成的可执行文件路径。"""
-    name = "ftpred.exe" if os.name == "nt" else "ftpred"
+def _loader_candidates(source_path: Path) -> List[Path]:
+    """Return ftpred_loader.py candidates beside a predictor/evaluator path."""
+    if source_path.is_file():
+        return [source_path.parent / "ftpred_loader.py"]
     return [
-        source_dir / "build" / "Release" / name,
-        source_dir / "build" / name,
+        source_path / "ftpred_loader.py",
+        source_path / "feedthrough" / "ftpred_loader.py",
     ]
+
+
+def load_ftpred_loader(source_path: Path, role: str) -> ModuleType:
+    """Load the predictor/evaluator's own ftpred_loader.py with an isolated name."""
+    source_path = Path(source_path)
+    for candidate in _loader_candidates(source_path):
+        if candidate.exists():
+            loader_path = candidate
+            break
+    else:
+        checked = ", ".join(str(path) for path in _loader_candidates(source_path))
+        raise FileNotFoundError(
+            f"未找到 {role} 使用的 ftpred_loader.py，已检查：{checked}"
+        )
+
+    digest = hashlib.sha1(str(loader_path.resolve()).encode("utf-8")).hexdigest()[:12]
+    module_name = f"_stage1_{role}_ftpred_loader_{digest}"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    spec = importlib.util.spec_from_file_location(module_name, loader_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"无法加载 {role} ftpred_loader：{loader_path}")
+
+    loader_dir = str(loader_path.parent)
+    added_to_path = False
+    if loader_dir not in sys.path:
+        sys.path.insert(0, loader_dir)
+        added_to_path = True
+    try:
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        if added_to_path:
+            try:
+                sys.path.remove(loader_dir)
+            except ValueError:
+                pass
+
+
+def _platform_executable_names(base_name: str) -> List[str]:
+    """Return executable name variants for the current platform."""
+    names = [base_name]
+    if os.name == "nt" and not base_name.lower().endswith(".exe"):
+        names.insert(0, f"{base_name}.exe")
+    return names
+
+
+def _predictor_candidates(source_path: Path) -> List[Path]:
+    """返回 feedthrough 预测器/评估器可能的可执行文件路径。"""
+    if source_path.is_file():
+        return [source_path]
+
+    executable_names: List[str] = []
+    for base_name in ("ftpred", source_path.name):
+        for name in _platform_executable_names(base_name):
+            if name not in executable_names:
+                executable_names.append(name)
+
+    candidates: List[Path] = []
+    for name in executable_names:
+        candidates.extend(
+            [
+                source_path / name,
+                source_path / "build" / "Release" / name,
+                source_path / "build" / name,
+            ]
+        )
+    return candidates
 
 
 def _cmake_executable() -> str:
@@ -244,13 +322,14 @@ def ensure_ftpred_executable(
     cmake_generator: str | None = None,
 ) -> Path:
     """查找预测器可执行文件；默认不编译，显式 auto_build=True 时才调用 CMake。"""
+    source_dir = Path(source_dir)
     for candidate in _predictor_candidates(source_dir):
         if candidate.exists():
             return candidate
 
     if not auto_build:
         raise FileNotFoundError(
-            f"未找到 ftpred 可执行文件，请先在 {source_dir} 下执行 CMake 编译。"
+            f"未找到 feedthrough 可执行文件，请检查路径或预先编译：{source_dir}"
         )
 
     build_dir = source_dir / "build"
@@ -319,6 +398,7 @@ def final_net_metrics(
         auto_build=auto_build_feedthrough,
         cmake_generator=cmake_generator,
     )
+    ftpred_loader = load_ftpred_loader(feedthrough_source_dir, "evaluate")
     modules_text = ftpred_loader.build_modules_text(placedb)
     with ftpred_loader.FtpredBinSession(str(executable), modules_text) as session:
         for metric, net in zip(metrics, placedb.nets_list):

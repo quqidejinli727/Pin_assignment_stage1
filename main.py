@@ -152,6 +152,8 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         reward_normalization_floor=config.reward_normalization_floor,
         reward_scale=config.reward_scale,
         feedthrough_source_dir=config.feedthrough_source_dir,
+        feedthrough_predict_source_dir=config.feedthrough_predict_source_dir,
+        feedthrough_evaluate_source_dir=config.feedthrough_evaluate_source_dir,
         enable_feedthrough=config.enable_feedthrough,
         auto_build_feedthrough=config.auto_build_feedthrough,
         cmake_generator=config.cmake_generator,
@@ -164,7 +166,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
             encoding="utf-8",
         )
         metrics = solver.final_net_metrics(
-            feedthrough_source_dir=config.feedthrough_source_dir,
+            feedthrough_source_dir=config.feedthrough_evaluate_source_dir,
             enable_feedthrough=config.enable_feedthrough,
             auto_build_feedthrough=config.auto_build_feedthrough,
             cmake_generator=config.cmake_generator,

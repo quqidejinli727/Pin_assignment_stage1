@@ -45,6 +45,8 @@ class AssignmentSolver:
         reward_normalization_floor: float = 1.0,
         reward_scale: float = 1.0,
         feedthrough_source_dir: str | Path | None = None,
+        feedthrough_predict_source_dir: str | Path | None = None,
+        feedthrough_evaluate_source_dir: str | Path | None = None,
         enable_feedthrough: bool = True,
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
@@ -70,6 +72,16 @@ class AssignmentSolver:
         self.reward_normalization_floor = reward_normalization_floor
         self.reward_scale = reward_scale
         self.feedthrough_source_dir = Path(feedthrough_source_dir) if feedthrough_source_dir else None
+        self.feedthrough_predict_source_dir = (
+            Path(feedthrough_predict_source_dir)
+            if feedthrough_predict_source_dir
+            else self.feedthrough_source_dir
+        )
+        self.feedthrough_evaluate_source_dir = (
+            Path(feedthrough_evaluate_source_dir)
+            if feedthrough_evaluate_source_dir
+            else self.feedthrough_source_dir
+        )
         self.auto_build_feedthrough = auto_build_feedthrough
         self.cmake_generator = cmake_generator
         self.feedthrough_context: FeedthroughContext | None = None
@@ -155,13 +167,16 @@ class AssignmentSolver:
             return
         if not self.enable_feedthrough or self.feedthrough_weight == 0.0:
             return
-        if self.feedthrough_source_dir is None:
-            raise ValueError("feedthrough_source_dir is required when feedthrough reward is enabled.")
+        if self.feedthrough_predict_source_dir is None:
+            raise ValueError(
+                "feedthrough_predict_source_dir is required when feedthrough reward is enabled."
+            )
         self.feedthrough_context = FeedthroughContext(
             self.placedb,
-            self.feedthrough_source_dir,
+            self.feedthrough_predict_source_dir,
             auto_build_feedthrough=self.auto_build_feedthrough,
             cmake_generator=self.cmake_generator,
+            role="predict",
         )
 
     def close_feedthrough_context(self) -> None:
@@ -172,19 +187,25 @@ class AssignmentSolver:
 
     def final_net_metrics(
         self,
-        feedthrough_source_dir: str | Path,
+        feedthrough_source_dir: str | Path | None = None,
         enable_feedthrough: bool = True,
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
     ):
-        """Compute final metrics, reusing the shared feedthrough context when available."""
+        """Compute final metrics with the feedthrough evaluator executable."""
+        source_dir = (
+            Path(feedthrough_source_dir)
+            if feedthrough_source_dir
+            else self.feedthrough_evaluate_source_dir
+        )
+        if source_dir is None:
+            raise ValueError("feedthrough_evaluate_source_dir is required for final metrics.")
         return final_net_metrics(
             self.placedb,
-            Path(feedthrough_source_dir),
+            source_dir,
             enable_feedthrough=enable_feedthrough,
             auto_build_feedthrough=auto_build_feedthrough,
             cmake_generator=cmake_generator,
-            feedthrough_context=self.feedthrough_context,
         )
 
     def _collect_pins(self, nets: List[Net]) -> List[Pin]:

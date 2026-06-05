@@ -32,8 +32,12 @@ class RunConfig:
     results_root: Path = PROJECT_DIR / "run_results"
     # 适配接口格式的 final_result 输出目录。
     interface_result_dir: Path = PROJECT_DIR / "mcts_result" / "final_result"
-    # feedthrough/FLUTE 预测器源码与可执行文件所在目录。
+    # 旧版 feedthrough 程序路径；当下面 predict/evaluate 路径未单独设置时作为兼容 fallback。
     feedthrough_source_dir: Path = PROJECT_DIR / "feedthrough"
+    # MCTS 搜索 reward 使用的 feedthrough 预测器路径，可为可执行文件或包含 build/ftpred 的目录。
+    feedthrough_predict_source_dir: Path = PROJECT_DIR / "feedthrough_predict"
+    # Stage1 最终指标统计使用的 feedthrough 评估器路径，可为可执行文件或包含 build/ftpred 的目录。
+    feedthrough_evaluate_source_dir: Path = PROJECT_DIR / "feedthrough_evaluate"
     # MCTS 输入基准模拟次数；Basic 动态模式下作为 N_base。
     simulations: int = 4096
     # 随机种子，用于保证 MCTS 随机补全可复现。
