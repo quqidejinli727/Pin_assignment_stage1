@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
-from typing import Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Tuple
 
 from PlaceDB import Net, PlaceDB
 from geometry_utils import Point, hpwl
@@ -70,6 +70,9 @@ class FeedthroughContext:
         self.ftpred_loader = load_ftpred_loader(feedthrough_source_dir, role)
         modules_text = self.ftpred_loader.build_modules_text(placedb)
         self.session = self.ftpred_loader.FtpredBinSession(str(executable), modules_text)
+        self.feedthrough_cache: Dict[Tuple[object, ...], float] = {}
+        self.cache_hits = 0
+        self.cache_misses = 0
 
     def close(self) -> None:
         """Close the long-lived predictor session."""
@@ -95,6 +98,21 @@ class FeedthroughContext:
                 pin.y = y
             net.feedthrough = old_net_feedthrough
 
+    def run_one_net_at_locations_cached(
+        self,
+        net: Net,
+        cache_key: Tuple[object, ...],
+        locations_factory: Callable[[], Dict[str, Point]],
+    ) -> float:
+        """Evaluate one net with a full-flow cache and lazy location construction."""
+        if cache_key in self.feedthrough_cache:
+            self.cache_hits += 1
+            return self.feedthrough_cache[cache_key]
+        self.cache_misses += 1
+        value = self.run_one_net_at_locations(net, locations_factory())
+        self.feedthrough_cache[cache_key] = value
+        return value
+
 
 class RewardEvaluator:
     """Evaluate MCTS rewards with per-net reference normalization."""
@@ -119,7 +137,19 @@ class RewardEvaluator:
         self.normalization_floor = normalization_floor
         self.reward_scale = reward_scale
         self.feedthrough_context = feedthrough_context
-        self._candidate_feedthrough_cache: Dict[Tuple[int, Tuple[Point, ...]], float] = {}
+        self._pin_estimate_cache: Dict[str, Point] = {}
+        self._net_pins = {id(net): list(net.pins) for net in self.nets}
+        self._net_pin_names = {
+            id(net): {pin.full_name for pin in net.pins}
+            for net in self.nets
+        }
+        self._net_base_locations = {
+            id(net): {
+                pin.full_name: self._pin_base_location(pin)
+                for pin in net.pins
+            }
+            for net in self.nets
+        }
 
         if self.enable_feedthrough and self.feedthrough_context is None:
             raise ValueError("feedthrough_context is required when feedthrough reward is enabled.")
@@ -131,7 +161,7 @@ class RewardEvaluator:
 
     def close(self) -> None:
         """Release local evaluator caches without closing the shared predictor."""
-        self._candidate_feedthrough_cache.clear()
+        self._pin_estimate_cache.clear()
 
     def evaluate(self, temporary_locations: Dict[str, Point]) -> float:
         """Return weighted normalized reward for a complete candidate assignment."""
@@ -162,7 +192,11 @@ class RewardEvaluator:
         }
         reference_hpwl = net_hpwl(net, self.placedb, reference_locations)
         reference_feedthrough = (
-            self._feedthrough_at_locations(net, reference_locations)
+            self._feedthrough_at_locations(
+                net,
+                ("reference", id(net)),
+                lambda: reference_locations,
+            )
             if self.enable_feedthrough
             else 0.0
         )
@@ -173,26 +207,60 @@ class RewardEvaluator:
         net: Net,
         temporary_locations: Dict[str, Point],
     ) -> float:
-        locations = {
-            pin.full_name: temporary_locations.get(
-                pin.full_name,
-                self.placedb.get_pin_location_estimate(pin),
-            )
-            for pin in net.pins
-        }
-        key = (id(net), tuple(self._rounded_point(locations[pin.full_name]) for pin in net.pins))
-        if key not in self._candidate_feedthrough_cache:
-            self._candidate_feedthrough_cache[key] = self._feedthrough_at_locations(net, locations)
-        return self._candidate_feedthrough_cache[key]
+        net_id = id(net)
+        base_locations = self._net_base_locations[net_id]
+        net_pin_names = self._net_pin_names[net_id]
+        changed = []
+        for pin_name, point in temporary_locations.items():
+            if pin_name not in net_pin_names:
+                continue
+            rounded = self._rounded_point(point)
+            if rounded != self._rounded_point(base_locations[pin_name]):
+                changed.append((pin_name, rounded))
+        key = ("candidate", net_id, tuple(sorted(changed)))
+        return self._feedthrough_at_locations(
+            net,
+            key,
+            lambda: self._net_locations_from_changes(net, temporary_locations),
+        )
 
-    def _feedthrough_at_locations(self, net: Net, locations: Dict[str, Point]) -> float:
+    def _feedthrough_at_locations(
+        self,
+        net: Net,
+        cache_key: Tuple[object, ...],
+        locations_factory: Callable[[], Dict[str, Point]],
+    ) -> float:
         if self.feedthrough_context is None:
             return 0.0
-        return self.feedthrough_context.run_one_net_at_locations(net, locations)
+        if not hasattr(self.feedthrough_context, "run_one_net_at_locations_cached"):
+            return self.feedthrough_context.run_one_net_at_locations(net, locations_factory())
+        return self.feedthrough_context.run_one_net_at_locations_cached(
+            net,
+            cache_key,
+            locations_factory,
+        )
 
     def _normalized_improvement(self, reference: float, candidate: float) -> float:
         denominator = max(abs(reference), self.normalization_floor)
         return (reference - candidate) / denominator
+
+    def _pin_base_location(self, pin) -> Point:
+        if pin.full_name not in self._pin_estimate_cache:
+            self._pin_estimate_cache[pin.full_name] = self.placedb.get_pin_location_estimate(pin)
+        return self._pin_estimate_cache[pin.full_name]
+
+    def _net_locations_from_changes(
+        self,
+        net: Net,
+        temporary_locations: Dict[str, Point],
+    ) -> Dict[str, Point]:
+        base_locations = self._net_base_locations[id(net)]
+        net_pin_names = self._net_pin_names[id(net)]
+        locations = dict(base_locations)
+        for pin_name, point in temporary_locations.items():
+            if pin_name in net_pin_names:
+                locations[pin_name] = point
+        return locations
 
     @staticmethod
     def _rounded_point(point: Point) -> Point:
