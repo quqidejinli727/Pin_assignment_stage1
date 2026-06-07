@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from PlaceDB import Net, PlaceDB
 from geometry_utils import Point
 from homology import PinHomologyGroup
-from scoring import FeedthroughContext, RewardEvaluator
+from scoring import FeedthroughContext, RewardEvaluator, net_hpwl
 from segment import AbstractSegment, SegmentManager, SegmentUsage
 
 
@@ -39,6 +40,21 @@ class MCTSNode:
         return self.total_reward / self.visits
 
 
+@dataclass
+class SearchProfile:
+    """Static search-space summary for one local MCTS tree."""
+
+    depth: int
+    branch_counts: List[int]
+    average_branching: float
+    max_branching: int
+    log_total_space: float
+
+    @property
+    def has_dead_layer(self) -> bool:
+        return any(count <= 0 for count in self.branch_counts)
+
+
 class MCTSSolver:
     """针对一批 pins_in 相关同构组运行一棵 MCTS 树。"""
 
@@ -61,10 +77,29 @@ class MCTSSolver:
         tail_depth: int = 8,
         early_stop_std_multiplier: float = 2.0,
         enable_tail_early_stop: bool = True,
+        enable_search_diagnostics: bool = False,
         basic_dynamic_simulations: bool = True,
         basic_space_scale_divisor: float = 1_000_000.0,
         basic_max_space_factor: float = 10.0,
         basic_min_simulations: int = 256,
+        hybrid_basic_depth_limit: int = 10,
+        hybrid_basic_log_space_limit: float = math.log(1_000_000.0),
+        hybrid_beam_width: int = 4,
+        hybrid_tail_beam_width: int = 8,
+        hybrid_tail_depth: int = 20,
+        hybrid_budget_decay: float = 0.7,
+        hybrid_tail_budget_decay: float = 0.9,
+        hybrid_min_layer_simulations: int = 128,
+        hybrid_max_layer_simulations: int = 2048,
+        hybrid_max_tree_simulations: int = 20_000,
+        hybrid_enable_layer_early_stop: bool = True,
+        hybrid_early_stop_std_multiplier: float = 2.0,
+        hybrid_time_limit_seconds: float = 0.0,
+        enable_candidate_pruning: bool = True,
+        candidate_top_k: int = 12,
+        candidate_tail_top_k: int = 8,
+        candidate_min_count: int = 16,
+        candidate_score_tolerance: float = 0.05,
         wirelength_weight: float = 1.0,
         feedthrough_weight: float = 0.0,
         reward_normalization_floor: float = 1.0,
@@ -90,10 +125,32 @@ class MCTSSolver:
         self.tail_depth = tail_depth
         self.early_stop_std_multiplier = early_stop_std_multiplier
         self.enable_tail_early_stop = enable_tail_early_stop
+        self.enable_search_diagnostics = enable_search_diagnostics
         self.basic_dynamic_simulations = basic_dynamic_simulations
         self.basic_space_scale_divisor = basic_space_scale_divisor
         self.basic_max_space_factor = basic_max_space_factor
         self.basic_min_simulations = basic_min_simulations
+        self.hybrid_basic_depth_limit = hybrid_basic_depth_limit
+        self.hybrid_basic_log_space_limit = hybrid_basic_log_space_limit
+        self.hybrid_beam_width = max(1, hybrid_beam_width)
+        self.hybrid_tail_beam_width = max(1, hybrid_tail_beam_width)
+        self.hybrid_tail_depth = hybrid_tail_depth
+        self.hybrid_budget_decay = hybrid_budget_decay
+        self.hybrid_tail_budget_decay = hybrid_tail_budget_decay
+        self.hybrid_min_layer_simulations = hybrid_min_layer_simulations
+        self.hybrid_max_layer_simulations = hybrid_max_layer_simulations
+        self.hybrid_max_tree_simulations = hybrid_max_tree_simulations
+        self.hybrid_enable_layer_early_stop = hybrid_enable_layer_early_stop
+        self.hybrid_early_stop_std_multiplier = hybrid_early_stop_std_multiplier
+        self.hybrid_time_limit_seconds = hybrid_time_limit_seconds
+        self.enable_candidate_pruning = enable_candidate_pruning
+        self.candidate_top_k = max(1, candidate_top_k)
+        self.candidate_tail_top_k = max(1, candidate_tail_top_k)
+        self.candidate_min_count = max(1, candidate_min_count)
+        self.candidate_score_tolerance = max(0.0, candidate_score_tolerance)
+        self._candidate_score_cache: Dict[Tuple[str, str], float] = {}
+        self.last_search_profile: SearchProfile | None = None
+        self.last_search_diagnostics: Dict[str, object] = {}
         self.reward_evaluator = RewardEvaluator(
             self.nets,
             self.placedb,
@@ -112,9 +169,11 @@ class MCTSSolver:
                 return self._search_basic()
             if self.search_mode == "layered":
                 return self._search_layered()
+            if self.search_mode == "hybrid":
+                return self._search_hybrid()
             raise ValueError(
                 f"Unsupported MCTS search mode: {self.search_mode!r}. "
-                "Use 'layered' or 'basic'."
+                "Use 'basic', 'layered', or 'hybrid'."
             )
         finally:
             self.reward_evaluator.close()
@@ -185,6 +244,105 @@ class MCTSSolver:
             return self._greedy_assignment(root.usage)
         return self._extract_best_path(best)
 
+    def _search_hybrid(self) -> Dict[str, str]:
+        """Run adaptive Hybrid search: Basic for small trees, beam-layered otherwise."""
+        root = MCTSNode(
+            group_index=0,
+            usage=self.segment_manager.snapshot_usage(),
+            assignments={},
+        )
+        if not self.groups:
+            return {}
+
+        profile = self._search_profile(root.usage)
+        self.last_search_profile = profile
+        if self._hybrid_uses_basic(profile):
+            self.last_search_diagnostics = {
+                "mode": "hybrid",
+                "route": "basic",
+                "depth": profile.depth,
+                "log_total_space": profile.log_total_space,
+            }
+            return self._search_basic()
+
+        return self._search_hybrid_beam(root, profile)
+
+    def _search_hybrid_beam(
+        self,
+        root: MCTSNode,
+        profile: SearchProfile,
+    ) -> Dict[str, str]:
+        """Beam-layered Hybrid search for medium/deep local trees."""
+        beam = [root]
+        total_budget = self._hybrid_total_budget(profile)
+        used_simulations = 0
+        start_time = time.monotonic()
+        route = "tail" if self._hybrid_uses_tail_profile(profile) else "beam"
+        self.last_search_diagnostics = {
+            "mode": "hybrid",
+            "route": route,
+            "depth": profile.depth,
+            "log_total_space": profile.log_total_space,
+            "total_budget": total_budget,
+            "layer_budgets": [],
+        }
+
+        for depth in range(1, len(self.groups) + 1):
+            if not beam or self._hybrid_time_exceeded(start_time):
+                break
+            if used_simulations >= total_budget:
+                break
+
+            tail_profile = self._hybrid_uses_tail_profile(profile, depth)
+            children: List[MCTSNode] = []
+            for node in beam:
+                if node.group_index >= len(self.groups):
+                    children.append(node)
+                    continue
+                actions = self._actions_for_node(node, tail_profile=tail_profile)
+                if not actions:
+                    continue
+                for action in actions:
+                    children.append(self._create_child(node, action))
+
+            if not children:
+                best_partial = max(beam, key=lambda node: len(node.assignments))
+                if best_partial is root:
+                    return self._greedy_assignment(root.usage)
+                return self._complete_greedily(best_partial.assignments, best_partial.usage)
+
+            layer_budget = min(
+                self._hybrid_layer_budget(total_budget, depth, tail_profile),
+                total_budget - used_simulations,
+            )
+            self.last_search_diagnostics["layer_budgets"].append(layer_budget)
+            for _ in range(layer_budget):
+                if self._hybrid_time_exceeded(start_time):
+                    break
+                child = self._select_layer_child(children)
+                reward = self._simulate(child)
+                self._record_layer_result(child.parent or root, child, reward)
+                used_simulations += 1
+                if used_simulations >= total_budget:
+                    break
+
+            beam = self._select_hybrid_beam(children, tail_profile)
+            if (
+                self.hybrid_enable_layer_early_stop
+                and self._has_decisive_score_lead(
+                    children,
+                    self.hybrid_early_stop_std_multiplier,
+                )
+            ):
+                break
+
+        best = self._best_node_from_beam(beam)
+        if best is None:
+            return self._greedy_assignment(root.usage)
+        if len(best.assignments) < len(self.groups):
+            return self._complete_greedily(best.assignments, best.usage)
+        return best.assignments
+
     def _basic_simulation_budget(self, usage: SegmentUsage) -> int:
         """Return the actual Basic-mode simulation count for this local tree."""
         if not self.basic_dynamic_simulations:
@@ -192,6 +350,136 @@ class MCTSSolver:
         space_factor = self._total_search_space_factor(usage)
         scaled_budget = math.ceil(self.simulations * space_factor)
         return max(self.basic_min_simulations, scaled_budget)
+
+    def _search_profile(self, usage: SegmentUsage) -> SearchProfile:
+        """Build a static search-space profile for the current local tree."""
+        branch_counts = [
+            len(self._raw_feasible_segments(group, usage))
+            for group in self.groups
+            if not group.assigned
+        ]
+        log_total_space = 0.0
+        for count in branch_counts:
+            if count <= 0:
+                log_total_space = float("-inf")
+                break
+            log_total_space += math.log(count)
+        average_branching = (
+            sum(branch_counts) / len(branch_counts)
+            if branch_counts
+            else 0.0
+        )
+        return SearchProfile(
+            depth=len(branch_counts),
+            branch_counts=branch_counts,
+            average_branching=average_branching,
+            max_branching=max(branch_counts, default=0),
+            log_total_space=log_total_space,
+        )
+
+    def _hybrid_uses_basic(self, profile: SearchProfile) -> bool:
+        """Return whether Hybrid should route this tree to the Basic fast path."""
+        return (
+            profile.depth <= self.hybrid_basic_depth_limit
+            and profile.log_total_space <= self.hybrid_basic_log_space_limit
+        )
+
+    def _hybrid_uses_tail_profile(
+        self,
+        profile: SearchProfile,
+        depth: int | None = None,
+    ) -> bool:
+        """Return whether Hybrid should use the tail profile for this tree/layer."""
+        current_depth = depth if depth is not None else profile.depth
+        return (
+            current_depth >= self.hybrid_tail_depth
+            or profile.depth >= self.hybrid_tail_depth
+            or profile.log_total_space > self.hybrid_basic_log_space_limit * 2
+            or profile.max_branching >= self.candidate_min_count * 4
+        )
+
+    def _hybrid_total_budget(self, profile: SearchProfile) -> int:
+        """Return the capped total simulation budget for Hybrid beam search."""
+        if profile.has_dead_layer:
+            return self.hybrid_min_layer_simulations
+        if self.basic_space_scale_divisor > 0 and profile.log_total_space != float("-inf"):
+            log_factor = profile.log_total_space - math.log(self.basic_space_scale_divisor)
+            factor = math.exp(min(log_factor, math.log(max(1.0, self.basic_max_space_factor))))
+            factor = max(1.0, factor)
+        else:
+            factor = 1.0
+        budget = max(
+            self.hybrid_min_layer_simulations,
+            math.ceil(self.simulations * factor),
+        )
+        if self.hybrid_max_tree_simulations > 0:
+            budget = min(budget, self.hybrid_max_tree_simulations)
+        return budget
+
+    def _hybrid_layer_budget(
+        self,
+        total_budget: int,
+        depth: int,
+        tail_profile: bool,
+    ) -> int:
+        """Return a capped per-layer simulation budget for Hybrid."""
+        if tail_profile:
+            multiplier = (
+                self.hybrid_budget_decay ** max(self.hybrid_tail_depth - 1, 0)
+                * self.hybrid_tail_budget_decay ** max(depth - self.hybrid_tail_depth, 0)
+            )
+        else:
+            multiplier = self.hybrid_budget_decay ** (depth - 1)
+        budget = max(
+            self.hybrid_min_layer_simulations,
+            math.ceil(total_budget * multiplier),
+        )
+        if self.hybrid_max_layer_simulations > 0:
+            budget = min(budget, self.hybrid_max_layer_simulations)
+        return budget
+
+    def _hybrid_time_exceeded(self, start_time: float) -> bool:
+        """Return whether the optional Hybrid wall-clock limit has been exceeded."""
+        if self.hybrid_time_limit_seconds <= 0:
+            return False
+        return time.monotonic() - start_time >= self.hybrid_time_limit_seconds
+
+    def _select_hybrid_beam(
+        self,
+        children: List[MCTSNode],
+        tail_profile: bool,
+    ) -> List[MCTSNode]:
+        """Keep the best Hybrid child nodes for the next layer."""
+        beam_width = self.hybrid_tail_beam_width if tail_profile else self.hybrid_beam_width
+        ranked = sorted(children, key=self._node_selection_score, reverse=True)
+        return ranked[:beam_width]
+
+    def _best_node_from_beam(self, beam: List[MCTSNode]) -> Optional[MCTSNode]:
+        """Return the best current Hybrid beam node."""
+        if not beam:
+            return None
+        return max(beam, key=self._node_selection_score)
+
+    def _node_selection_score(self, node: MCTSNode) -> float:
+        """Score nodes for Hybrid beam retention."""
+        if node.visits > 0:
+            return node.average_reward
+        return float("-inf")
+
+    def _has_decisive_score_lead(
+        self,
+        children: List[MCTSNode],
+        multiplier: float,
+    ) -> bool:
+        """Judge whether the best visited child has a clear average-reward lead."""
+        visited_scores = [child.average_reward for child in children if child.visits > 0]
+        if len(visited_scores) < 2:
+            return False
+        ordered = sorted(visited_scores, reverse=True)
+        mean = sum(visited_scores) / len(visited_scores)
+        variance = sum((score - mean) ** 2 for score in visited_scores) / len(visited_scores)
+        std = math.sqrt(variance)
+        return ordered[0] - ordered[1] > multiplier * std
 
     def _total_search_space_factor(self, usage: SegmentUsage) -> float:
         """Estimate the total combinational search space as a capped scale factor."""
@@ -340,13 +628,87 @@ class MCTSSolver:
         if node.untried_actions is not None:
             return node.untried_actions
 
-        group = self.groups[node.group_index]
-        actions = []
-        for segment in self.segment_manager.candidates_for_module(group.module_name):
-            if node.usage.can_assign(segment, group.max_pin_width):
-                actions.append((group.name, segment.segment_id))
-        node.untried_actions = actions
+        node.untried_actions = self._actions_for_node(node, tail_profile=False)
         return node.untried_actions
+
+    def _actions_for_node(
+        self,
+        node: MCTSNode,
+        tail_profile: bool = False,
+    ) -> List[Action]:
+        """Return capacity-feasible actions, optionally candidate-pruned."""
+        group = self.groups[node.group_index]
+        segments = self._candidate_segments(group, node.usage, tail_profile=tail_profile)
+        return [(group.name, segment.segment_id) for segment in segments]
+
+    def _raw_feasible_segments(
+        self,
+        group: PinHomologyGroup,
+        usage: SegmentUsage,
+    ) -> List[AbstractSegment]:
+        """Return all capacity-feasible segments for one group."""
+        return [
+            segment
+            for segment in self.segment_manager.candidates_for_module(group.module_name)
+            if usage.can_assign(segment, group.max_pin_width)
+        ]
+
+    def _candidate_segments(
+        self,
+        group: PinHomologyGroup,
+        usage: SegmentUsage,
+        tail_profile: bool = False,
+    ) -> List[AbstractSegment]:
+        """Return feasible segments after optional conservative pruning."""
+        feasible = self._raw_feasible_segments(group, usage)
+        if not self.enable_candidate_pruning:
+            return feasible
+        if len(feasible) < self.candidate_min_count:
+            return feasible
+
+        top_k = self.candidate_tail_top_k if tail_profile else self.candidate_top_k
+        top_k = min(max(1, top_k), len(feasible))
+        scored = sorted(
+            ((self._candidate_pruning_score(group, segment), segment) for segment in feasible),
+            key=lambda item: (item[0], item[1].remaining_capacity, item[1].segment_id),
+            reverse=True,
+        )
+        best_score = scored[0][0]
+        tolerance = abs(best_score) * self.candidate_score_tolerance
+        kept = [
+            segment
+            for index, (score, segment) in enumerate(scored)
+            if index < top_k or score >= best_score - tolerance
+        ]
+        return kept or feasible
+
+    def _candidate_pruning_score(
+        self,
+        group: PinHomologyGroup,
+        segment: AbstractSegment,
+    ) -> float:
+        """Score one segment using a local HPWL-only heuristic for pruning."""
+        key = (group.name, segment.segment_id)
+        if key in self._candidate_score_cache:
+            return self._candidate_score_cache[key]
+
+        temporary_locations = {}
+        for pin in group.pins:
+            try:
+                instance = self.segment_manager.get_instance(pin.parent_inst, segment.segment_id)
+            except KeyError:
+                continue
+            temporary_locations[pin.full_name] = instance.midpoint
+
+        related_pin_names = {pin.full_name for pin in group.pins}
+        score = 0.0
+        for net in self.nets:
+            if not any(pin.full_name in related_pin_names for pin in net.pins):
+                continue
+            score -= net_hpwl(net, self.placedb, temporary_locations)
+        score += 1e-6 * segment.remaining_capacity
+        self._candidate_score_cache[key] = score
+        return score
 
     def _simulate(self, node: MCTSNode) -> float:
         """从当前节点开始随机补全剩余分配并计算 reward。"""
@@ -354,11 +716,7 @@ class MCTSSolver:
         assignments = dict(node.assignments)
         for index in range(node.group_index, len(self.groups)):
             group = self.groups[index]
-            feasible = [
-                segment
-                for segment in self.segment_manager.candidates_for_module(group.module_name)
-                if usage.can_assign(segment, group.max_pin_width)
-            ]
+            feasible = self._candidate_segments(group, usage)
             if not feasible:
                 return -1.0e30
             segment = self.random.choice(feasible)
@@ -429,11 +787,7 @@ class MCTSSolver:
         for group in self.groups:
             if group.assigned or group.name in assigned_names:
                 continue
-            feasible = [
-                segment
-                for segment in self.segment_manager.candidates_for_module(group.module_name)
-                if local_usage.can_assign(segment, group.max_pin_width)
-            ]
+            feasible = self._candidate_segments(group, local_usage)
             if not feasible:
                 continue
             segment = self._best_completion_segment_by_reward(group, feasible, completed)

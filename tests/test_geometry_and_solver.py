@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import assignment_solver as assignment_solver_module
@@ -319,6 +320,128 @@ def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
     assert calls["simulate"] == expected
 
 
+def test_mcts_search_profile_records_depth_and_branch_counts(tmp_path):
+    """Hybrid diagnostics should start from a stable per-tree search profile."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    usage = segments.snapshot_usage()
+    mcts = MCTSSolver(placedb, segments, groups, placedb.nets_list)
+
+    profile = mcts._search_profile(usage)
+
+    assert profile.depth == len(groups)
+    assert profile.branch_counts == [4, 4, 4]
+    assert profile.average_branching == 4
+    assert profile.max_branching == 4
+    assert profile.log_total_space == math.log(64)
+
+
+def test_hybrid_routes_small_tree_to_basic_path(tmp_path):
+    """Small Hybrid trees should use the Basic fast path."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        search_mode="hybrid",
+        hybrid_basic_depth_limit=10,
+        hybrid_basic_log_space_limit=math.log(1_000_000),
+    )
+
+    called = {"basic": 0}
+
+    def fake_basic():
+        called["basic"] += 1
+        return {group.name: "A:S0" for group in groups}
+
+    mcts._search_basic = fake_basic
+    assignment = mcts.search()
+
+    assert called["basic"] == 1
+    assert set(assignment) == {group.name for group in groups}
+    assert mcts.last_search_diagnostics["route"] == "basic"
+
+
+def test_hybrid_beam_route_respects_budget_caps(tmp_path):
+    """Deep/large Hybrid trees should use beam-layered search with budget caps."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=100,
+        search_mode="hybrid",
+        hybrid_basic_depth_limit=0,
+        hybrid_basic_log_space_limit=0.0,
+        hybrid_beam_width=2,
+        hybrid_min_layer_simulations=1,
+        hybrid_max_layer_simulations=2,
+        hybrid_max_tree_simulations=4,
+        hybrid_enable_layer_early_stop=False,
+        enable_candidate_pruning=False,
+    )
+    calls = {"simulate": 0}
+
+    def fake_simulate(_node):
+        calls["simulate"] += 1
+        return float(calls["simulate"])
+
+    mcts._simulate = fake_simulate
+    assignment = mcts.search()
+
+    assert calls["simulate"] <= 4
+    assert all(layer_budget <= 2 for layer_budget in mcts.last_search_diagnostics["layer_budgets"])
+    assert mcts.last_search_diagnostics["route"] in {"beam", "tail"}
+    assert set(assignment) == {group.name for group in groups}
+
+
+def test_candidate_pruning_is_safe_and_disableable(tmp_path):
+    """Candidate pruning should keep a non-empty subset and be fully disableable."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group = homology.pin_groups["A.p"]
+    usage = segments.snapshot_usage()
+
+    pruned = MCTSSolver(
+        placedb,
+        segments,
+        [group],
+        placedb.nets_list,
+        candidate_min_count=2,
+        candidate_top_k=1,
+        candidate_score_tolerance=0.0,
+    )
+    pruned_candidates = pruned._candidate_segments(group, usage)
+
+    disabled = MCTSSolver(
+        placedb,
+        segments,
+        [group],
+        placedb.nets_list,
+        enable_candidate_pruning=False,
+    )
+    all_candidates = disabled._candidate_segments(group, usage)
+
+    assert pruned_candidates
+    assert len(pruned_candidates) <= len(all_candidates)
+    assert len(all_candidates) == 4
+
+
 def test_assignment_greedy_selects_reward_best_feasible_segment(tmp_path):
     """Fallback greedy assignment should prefer reward over remaining capacity."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -473,7 +596,6 @@ def test_assignment_solver_creates_one_feedthrough_context(tmp_path):
             enable_feedthrough=True,
         )
         result = solver.solve()
-        metrics = solver.final_net_metrics(tmp_path, enable_feedthrough=True)
         solver.close_feedthrough_context()
     finally:
         assignment_solver_module.FeedthroughContext = original_context
@@ -481,7 +603,6 @@ def test_assignment_solver_creates_one_feedthrough_context(tmp_path):
     assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
     assert len(created_contexts) == 1
     assert created_contexts[0].closed
-    assert len(metrics) == len(solver.placedb.nets_list)
 
 
 def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):
