@@ -124,6 +124,22 @@ class RunConfig:
     mcts_hybrid_early_stop_std_multiplier: float = 2.0
     # Hybrid 单棵树 wall-clock 时间上限；0 表示关闭，仅作为后续接口预留。
     mcts_hybrid_time_limit_seconds: float = 0.0
+    # Hybrid 超深树阈值；超过该深度后以“前缀搜索 + 快速补全”为主，避免 100+ 到 2000 深度逐层耗时失控。
+    mcts_hybrid_ultradeep_depth: int = 100
+    # Hybrid 超深树最多展开搜索的前缀深度，剩余同构组走快速补全。
+    mcts_hybrid_max_expanded_depth: int = 64
+    # Hybrid 超深树每层保留的 beam 路径数，通常取 1-2 控制运行时间。
+    mcts_hybrid_ultradeep_beam_width: int = 1
+    # Hybrid 超深树每层最小模拟次数，降低长尾树的固定层成本。
+    mcts_hybrid_ultradeep_min_layer_simulations: int = 32
+    # Hybrid 超深树每层最大模拟次数上限。
+    mcts_hybrid_ultradeep_max_layer_simulations: int = 128
+    # Hybrid 超深树搜索前缀结束后是否使用 HPWL/容量启发式快速补全，避免后段大量 FT reward 评估。
+    mcts_hybrid_use_fast_completion_for_ultradeep: bool = True
+
+    # ===== 同构组提交设置 =====
+    # 当前 pins_in 覆盖同构组 Pin 比例达到该阈值时，允许直接提交整组到同一 segment；1 表示仅完整覆盖才提交。
+    homology_group_commit_coverage_threshold: float = 0.5
 
     # ===== 候选剪枝设置 =====
     # 是否启用候选 segment 预剪枝，减少大分支树搜索空间。

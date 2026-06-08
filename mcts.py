@@ -98,6 +98,12 @@ class MCTSSolver:
         hybrid_enable_layer_early_stop: bool = True,
         hybrid_early_stop_std_multiplier: float = 2.0,
         hybrid_time_limit_seconds: float = 0.0,
+        hybrid_ultradeep_depth: int = 100,
+        hybrid_max_expanded_depth: int = 64,
+        hybrid_ultradeep_beam_width: int = 1,
+        hybrid_ultradeep_min_layer_simulations: int = 32,
+        hybrid_ultradeep_max_layer_simulations: int = 128,
+        hybrid_use_fast_completion_for_ultradeep: bool = True,
         enable_candidate_pruning: bool = True,
         candidate_top_k: int = 12,
         candidate_tail_top_k: int = 8,
@@ -150,6 +156,12 @@ class MCTSSolver:
         self.hybrid_enable_layer_early_stop = hybrid_enable_layer_early_stop
         self.hybrid_early_stop_std_multiplier = hybrid_early_stop_std_multiplier
         self.hybrid_time_limit_seconds = hybrid_time_limit_seconds
+        self.hybrid_ultradeep_depth = hybrid_ultradeep_depth
+        self.hybrid_max_expanded_depth = hybrid_max_expanded_depth
+        self.hybrid_ultradeep_beam_width = max(1, hybrid_ultradeep_beam_width)
+        self.hybrid_ultradeep_min_layer_simulations = hybrid_ultradeep_min_layer_simulations
+        self.hybrid_ultradeep_max_layer_simulations = hybrid_ultradeep_max_layer_simulations
+        self.hybrid_use_fast_completion_for_ultradeep = hybrid_use_fast_completion_for_ultradeep
         self.enable_candidate_pruning = enable_candidate_pruning
         self.candidate_top_k = max(1, candidate_top_k)
         self.candidate_tail_top_k = max(1, candidate_tail_top_k)
@@ -288,29 +300,37 @@ class MCTSSolver:
         total_budget = self._hybrid_total_budget(profile)
         used_simulations = 0
         start_time = time.monotonic()
-        route = "tail" if self._hybrid_uses_tail_profile(profile) else "beam"
+        ultradeep_profile = self._hybrid_uses_ultradeep_profile(profile)
+        route = (
+            "ultradeep"
+            if ultradeep_profile
+            else "tail" if self._hybrid_uses_tail_profile(profile) else "beam"
+        )
+        expanded_depth = self._hybrid_expanded_depth(profile)
         self.last_search_diagnostics = {
             "mode": "hybrid",
             "route": route,
             "depth": profile.depth,
+            "expanded_depth": expanded_depth,
             "log_total_space": profile.log_total_space,
             "total_budget": total_budget,
             "layer_budgets": [],
         }
 
-        for depth in range(1, len(self.groups) + 1):
+        for depth in range(1, expanded_depth + 1):
             if not beam or self._hybrid_time_exceeded(start_time):
                 break
             if used_simulations >= total_budget:
                 break
 
             tail_profile = self._hybrid_uses_tail_profile(profile, depth)
+            ultradeep_layer = ultradeep_profile
             children: List[MCTSNode] = []
             for node in beam:
                 if node.group_index >= len(self.groups):
                     children.append(node)
                     continue
-                actions = self._actions_for_node(node, tail_profile=tail_profile)
+                actions = self._actions_for_node(node, tail_profile=tail_profile or ultradeep_layer)
                 if not actions:
                     continue
                 for action in actions:
@@ -323,7 +343,7 @@ class MCTSSolver:
                 return self._complete_greedily(best_partial.assignments, best_partial.usage)
 
             layer_budget = min(
-                self._hybrid_layer_budget(total_budget, depth, tail_profile),
+                self._hybrid_layer_budget(total_budget, depth, tail_profile, ultradeep_layer),
                 total_budget - used_simulations,
             )
             self.last_search_diagnostics["layer_budgets"].append(layer_budget)
@@ -337,7 +357,7 @@ class MCTSSolver:
                 if used_simulations >= total_budget:
                     break
 
-            beam = self._select_hybrid_beam(children, tail_profile)
+            beam = self._select_hybrid_beam(children, tail_profile, ultradeep_layer)
             if (
                 self.hybrid_enable_layer_early_stop
                 and self._has_decisive_score_lead(
@@ -351,6 +371,8 @@ class MCTSSolver:
         if best is None:
             return self._greedy_assignment(root.usage)
         if len(best.assignments) < len(self.groups):
+            if ultradeep_profile and self.hybrid_use_fast_completion_for_ultradeep:
+                return self._complete_fast_by_heuristic(best.assignments, best.usage)
             return self._complete_greedily(best.assignments, best.usage)
         return best.assignments
 
@@ -418,6 +440,18 @@ class MCTSSolver:
             or profile.max_branching >= self.candidate_min_count * 4
         )
 
+    def _hybrid_uses_ultradeep_profile(self, profile: SearchProfile) -> bool:
+        """Return whether Hybrid should use the ultra-deep bounded prefix profile."""
+        return self.hybrid_ultradeep_depth > 0 and profile.depth >= self.hybrid_ultradeep_depth
+
+    def _hybrid_expanded_depth(self, profile: SearchProfile) -> int:
+        """Return how many layers Hybrid should explicitly search before completion."""
+        if not self._hybrid_uses_ultradeep_profile(profile):
+            return len(self.groups)
+        if self.hybrid_max_expanded_depth <= 0:
+            return len(self.groups)
+        return min(len(self.groups), self.hybrid_max_expanded_depth)
+
     def _hybrid_total_budget(self, profile: SearchProfile) -> int:
         """Return the capped total simulation budget for Hybrid beam search."""
         if profile.has_dead_layer:
@@ -441,6 +475,7 @@ class MCTSSolver:
         total_budget: int,
         depth: int,
         tail_profile: bool,
+        ultradeep_profile: bool = False,
     ) -> int:
         """Return a capped per-layer simulation budget for Hybrid."""
         if tail_profile:
@@ -454,6 +489,13 @@ class MCTSSolver:
             self.hybrid_min_layer_simulations,
             math.ceil(total_budget * multiplier),
         )
+        if ultradeep_profile:
+            budget = max(
+                self.hybrid_ultradeep_min_layer_simulations,
+                math.ceil(total_budget * multiplier),
+            )
+            if self.hybrid_ultradeep_max_layer_simulations > 0:
+                budget = min(budget, self.hybrid_ultradeep_max_layer_simulations)
         if self.hybrid_max_layer_simulations > 0:
             budget = min(budget, self.hybrid_max_layer_simulations)
         return budget
@@ -468,9 +510,13 @@ class MCTSSolver:
         self,
         children: List[MCTSNode],
         tail_profile: bool,
+        ultradeep_profile: bool = False,
     ) -> List[MCTSNode]:
         """Keep the best Hybrid child nodes for the next layer."""
-        beam_width = self.hybrid_tail_beam_width if tail_profile else self.hybrid_beam_width
+        if ultradeep_profile:
+            beam_width = self.hybrid_ultradeep_beam_width
+        else:
+            beam_width = self.hybrid_tail_beam_width if tail_profile else self.hybrid_beam_width
         ranked = sorted(children, key=self._node_selection_score, reverse=True)
         return ranked[:beam_width]
 
@@ -851,6 +897,33 @@ class MCTSSolver:
             feasible_segments,
             key=lambda item: item.remaining_capacity,
         )
+
+    def _complete_fast_by_heuristic(
+        self,
+        assignments: Dict[str, str],
+        usage: SegmentUsage,
+    ) -> Dict[str, str]:
+        """Complete very deep trees with a capacity-safe HPWL heuristic instead of FT reward."""
+        completed = dict(assignments)
+        local_usage = usage.clone()
+        assigned_names = set(completed)
+        for group in self.groups:
+            if group.assigned or group.name in assigned_names:
+                continue
+            feasible = self._candidate_segments(group, local_usage, tail_profile=True)
+            if not feasible:
+                continue
+            segment = max(
+                feasible,
+                key=lambda item: (
+                    self._candidate_pruning_score(group, item),
+                    item.remaining_capacity,
+                    item.segment_id,
+                ),
+            )
+            local_usage.assign(segment, group.max_pin_width)
+            completed[group.name] = segment.segment_id
+        return completed
 
     def _greedy_assignment(self, usage: SegmentUsage) -> Dict[str, str]:
         """在没有可用 MCTS 子节点时，直接生成贪心分配方案。"""

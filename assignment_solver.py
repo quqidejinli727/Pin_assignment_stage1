@@ -57,6 +57,13 @@ class AssignmentSolver:
         mcts_hybrid_enable_layer_early_stop: bool = True,
         mcts_hybrid_early_stop_std_multiplier: float = 2.0,
         mcts_hybrid_time_limit_seconds: float = 0.0,
+        mcts_hybrid_ultradeep_depth: int = 100,
+        mcts_hybrid_max_expanded_depth: int = 64,
+        mcts_hybrid_ultradeep_beam_width: int = 1,
+        mcts_hybrid_ultradeep_min_layer_simulations: int = 32,
+        mcts_hybrid_ultradeep_max_layer_simulations: int = 128,
+        mcts_hybrid_use_fast_completion_for_ultradeep: bool = True,
+        homology_group_commit_coverage_threshold: float = 0.5,
         mcts_enable_candidate_pruning: bool = True,
         mcts_candidate_top_k: int = 12,
         mcts_candidate_tail_top_k: int = 8,
@@ -107,6 +114,7 @@ class AssignmentSolver:
         self.auto_build_feedthrough = auto_build_feedthrough
         self.cmake_generator = cmake_generator
         self.feedthrough_context: FeedthroughContext | None = None
+        self.homology_group_commit_coverage_threshold = homology_group_commit_coverage_threshold
         self.mcts_options = {
             "search_mode": mcts_search_mode,
             "enable_search_diagnostics": mcts_enable_search_diagnostics,
@@ -139,6 +147,12 @@ class AssignmentSolver:
             "hybrid_enable_layer_early_stop": mcts_hybrid_enable_layer_early_stop,
             "hybrid_early_stop_std_multiplier": mcts_hybrid_early_stop_std_multiplier,
             "hybrid_time_limit_seconds": mcts_hybrid_time_limit_seconds,
+            "hybrid_ultradeep_depth": mcts_hybrid_ultradeep_depth,
+            "hybrid_max_expanded_depth": mcts_hybrid_max_expanded_depth,
+            "hybrid_ultradeep_beam_width": mcts_hybrid_ultradeep_beam_width,
+            "hybrid_ultradeep_min_layer_simulations": mcts_hybrid_ultradeep_min_layer_simulations,
+            "hybrid_ultradeep_max_layer_simulations": mcts_hybrid_ultradeep_max_layer_simulations,
+            "hybrid_use_fast_completion_for_ultradeep": mcts_hybrid_use_fast_completion_for_ultradeep,
             "enable_candidate_pruning": mcts_enable_candidate_pruning,
             "candidate_top_k": mcts_candidate_top_k,
             "candidate_tail_top_k": mcts_candidate_tail_top_k,
@@ -268,7 +282,7 @@ class AssignmentSolver:
     ) -> int:
         """提交当前 pins_in 中完整包含的同构组分配结果。"""
         pin_full_names: Set[str] = {pin.full_name for pin in pins_in}
-        contained_groups = self.homology.fully_contained_groups(related_groups, pin_full_names)
+        contained_groups = self._committable_groups(related_groups, pin_full_names)
         committed_count = 0
         for group in contained_groups:
             if group.assigned:
@@ -286,6 +300,23 @@ class AssignmentSolver:
             self._commit_group_assignment(group, segment_id)
             committed_count += 1
         return committed_count
+
+    def _committable_groups(
+        self,
+        related_groups: List[PinHomologyGroup],
+        pin_full_names: Set[str],
+    ) -> List[PinHomologyGroup]:
+        """Return groups fully covered or sufficiently represented by current pins_in."""
+        threshold = max(0.0, min(1.0, self.homology_group_commit_coverage_threshold))
+        committable = []
+        for group in related_groups:
+            if not group.pins:
+                continue
+            covered_count = sum(1 for pin in group.pins if pin.full_name in pin_full_names)
+            coverage_ratio = covered_count / len(group.pins)
+            if coverage_ratio >= threshold:
+                committable.append(group)
+        return committable
 
     def _validate_segment_assignment(
         self,

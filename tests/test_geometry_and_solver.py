@@ -163,6 +163,115 @@ def test_solver_supports_basic_mcts_search_mode(tmp_path):
     assert result["summary"]["unassigned_group_count"] == 0
 
 
+def test_partial_homology_group_can_commit_by_coverage_threshold(tmp_path):
+    """A partially visible homology group can be committed as a whole above threshold."""
+    block = {
+        "name": "TOP",
+        "module_name": "TOP",
+        "direction": 0,
+        "color": "#000000",
+        "vertex": [[0, 0], [120, 0], [120, 120], [0, 120]],
+        "children": [
+            {
+                "name": "TOP.U_A0",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_A1",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[20, 0], [30, 0], [30, 10], [20, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_A2",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[40, 0], [50, 0], [50, 10], [40, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_B0",
+                "module_name": "B",
+                "direction": 0,
+                "color": "#bbbbbb",
+                "vertex": [[80, 0], [90, 0], [90, 10], [80, 10]],
+                "children": [],
+            },
+        ],
+    }
+    pingroup = [
+        [
+            {
+                "parent_inst": "TOP.U_A0",
+                "parent_module": "A",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+            {
+                "parent_inst": "TOP.U_B0",
+                "parent_module": "B",
+                "pingroup_name": "q",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_A1",
+                "parent_module": "A",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_A2",
+                "parent_module": "A",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+        ],
+    ]
+    block_path = tmp_path / "block.json"
+    pingroup_path = tmp_path / "pingroup.json"
+    block_path.write_text(json.dumps(block), encoding="utf-8")
+    pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
+
+    solver = AssignmentSolver(
+        str(block_path),
+        str(pingroup_path),
+        simulations=1,
+        enable_segment_subdivision=False,
+        homology_group_commit_coverage_threshold=1 / 3,
+    )
+    group = solver.homology.pin_groups["A.p"]
+    pins_in = [solver.placedb.pin_dict["TOP.U_A0.p"], solver.placedb.pin_dict["TOP.U_B0.q"]]
+
+    committed = solver._commit_contained_groups(
+        [group],
+        pins_in,
+        {"A.p": "A:S0"},
+    )
+
+    assert committed == 1
+    assert group.assigned
+    assert all(pin.assigned_segment_id == "A:S0" for pin in group.pins)
+
+
 def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
     """Verify Basic mode scales N_base by the capped total search-space factor."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -469,6 +578,56 @@ def test_hybrid_beam_route_respects_budget_caps(tmp_path):
     assert all(layer_budget <= 2 for layer_budget in mcts.last_search_diagnostics["layer_budgets"])
     assert mcts.last_search_diagnostics["route"] in {"beam", "tail"}
     assert set(assignment) == {group.name for group in groups}
+
+
+def test_hybrid_ultradeep_limits_expanded_depth_and_fast_completes(tmp_path):
+    """Ultra-deep Hybrid trees should search only a bounded prefix before completion."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    base_groups = homology.unassigned_groups()
+    groups = base_groups * 40
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=100,
+        search_mode="hybrid",
+        hybrid_basic_depth_limit=0,
+        hybrid_ultradeep_depth=20,
+        hybrid_max_expanded_depth=5,
+        hybrid_ultradeep_beam_width=1,
+        hybrid_ultradeep_min_layer_simulations=1,
+        hybrid_ultradeep_max_layer_simulations=2,
+        hybrid_max_tree_simulations=20,
+        hybrid_enable_layer_early_stop=False,
+        enable_candidate_pruning=False,
+    )
+
+    calls = {"simulate": 0, "fast": 0}
+
+    def fake_simulate(_node):
+        calls["simulate"] += 1
+        return float(calls["simulate"])
+
+    def fake_fast(assignments, _usage):
+        calls["fast"] += 1
+        completed = dict(assignments)
+        for group in groups:
+            completed.setdefault(group.name, "A:S0" if group.module_name == "A" else "B:S0")
+        return completed
+
+    mcts._simulate = fake_simulate
+    mcts._complete_fast_by_heuristic = fake_fast
+    assignment = mcts.search()
+
+    assert mcts.last_search_diagnostics["route"] == "ultradeep"
+    assert mcts.last_search_diagnostics["expanded_depth"] == 5
+    assert calls["simulate"] <= 10
+    assert calls["fast"] == 1
+    assert set(assignment) == {group.name for group in base_groups}
 
 
 def test_candidate_pruning_is_safe_and_disableable(tmp_path):
