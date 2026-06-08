@@ -82,6 +82,9 @@ class MCTSSolver:
         basic_space_scale_divisor: float = 1_000_000.0,
         basic_max_space_factor: float = 10.0,
         basic_min_simulations: int = 256,
+        basic_depth1_simulations: int = 32,
+        basic_depth2_simulations: int = 256,
+        basic_disable_pruning_depth_limit: int = 1,
         hybrid_basic_depth_limit: int = 10,
         hybrid_basic_log_space_limit: float = math.log(1_000_000.0),
         hybrid_beam_width: int = 4,
@@ -130,6 +133,10 @@ class MCTSSolver:
         self.basic_space_scale_divisor = basic_space_scale_divisor
         self.basic_max_space_factor = basic_max_space_factor
         self.basic_min_simulations = basic_min_simulations
+        self.basic_depth1_simulations = basic_depth1_simulations
+        self.basic_depth2_simulations = basic_depth2_simulations
+        self.basic_disable_pruning_depth_limit = basic_disable_pruning_depth_limit
+        self._active_basic_depth: int | None = None
         self.hybrid_basic_depth_limit = hybrid_basic_depth_limit
         self.hybrid_basic_log_space_limit = hybrid_basic_log_space_limit
         self.hybrid_beam_width = max(1, hybrid_beam_width)
@@ -232,7 +239,11 @@ class MCTSSolver:
         if not self.groups:
             return {}
 
-        for _ in range(self._basic_simulation_budget(root.usage)):
+        profile = self._search_profile(root.usage)
+        self.last_search_profile = profile
+        self._active_basic_depth = profile.depth
+
+        for _ in range(self._basic_simulation_budget(root.usage, profile)):
             node = self._select(root)
             if node.group_index < len(self.groups):
                 node = self._expand(node)
@@ -343,8 +354,17 @@ class MCTSSolver:
             return self._complete_greedily(best.assignments, best.usage)
         return best.assignments
 
-    def _basic_simulation_budget(self, usage: SegmentUsage) -> int:
+    def _basic_simulation_budget(
+        self,
+        usage: SegmentUsage,
+        profile: SearchProfile | None = None,
+    ) -> int:
         """Return the actual Basic-mode simulation count for this local tree."""
+        profile = profile or self._search_profile(usage)
+        if profile.depth == 1 and self.basic_depth1_simulations > 0:
+            return max(1, self.basic_depth1_simulations)
+        if profile.depth == 2 and self.basic_depth2_simulations > 0:
+            return max(1, self.basic_depth2_simulations)
         if not self.basic_dynamic_simulations:
             return self.simulations
         space_factor = self._total_search_space_factor(usage)
@@ -661,7 +681,7 @@ class MCTSSolver:
     ) -> List[AbstractSegment]:
         """Return feasible segments after optional conservative pruning."""
         feasible = self._raw_feasible_segments(group, usage)
-        if not self.enable_candidate_pruning:
+        if not self.enable_candidate_pruning or self._basic_pruning_disabled():
             return feasible
         if len(feasible) < self.candidate_min_count:
             return feasible
@@ -681,6 +701,13 @@ class MCTSSolver:
             if index < top_k or score >= best_score - tolerance
         ]
         return kept or feasible
+
+    def _basic_pruning_disabled(self) -> bool:
+        """Return whether the active basic/basic-like tree should bypass pruning."""
+        return (
+            self._active_basic_depth is not None
+            and self._active_basic_depth <= self.basic_disable_pruning_depth_limit
+        )
 
     def _candidate_pruning_score(
         self,

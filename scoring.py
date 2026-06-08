@@ -30,6 +30,8 @@ def net_hpwl(
     temporary_locations: Dict[str, Point],
 ) -> float:
     """计算单条 Net 在临时 Pin 坐标下的 HPWL。"""
+    if len(net.pins) <= 1:
+        return 0.0
     points = []
     for pin in net.pins:
         if pin.full_name in temporary_locations:
@@ -137,18 +139,20 @@ class RewardEvaluator:
         self.normalization_floor = normalization_floor
         self.reward_scale = reward_scale
         self.feedthrough_context = feedthrough_context
+        self.metric_nets = [net for net in self.nets if len(net.pins) > 1]
+        self.skipped_single_pin_net_count = len(self.nets) - len(self.metric_nets)
         self._pin_estimate_cache: Dict[str, Point] = {}
-        self._net_pins = {id(net): list(net.pins) for net in self.nets}
+        self._net_pins = {id(net): list(net.pins) for net in self.metric_nets}
         self._net_pin_names = {
             id(net): {pin.full_name for pin in net.pins}
-            for net in self.nets
+            for net in self.metric_nets
         }
         self._net_base_locations = {
             id(net): {
                 pin.full_name: self._pin_base_location(pin)
                 for pin in net.pins
             }
-            for net in self.nets
+            for net in self.metric_nets
         }
 
         if self.enable_feedthrough and self.feedthrough_context is None:
@@ -156,7 +160,7 @@ class RewardEvaluator:
 
         self.reference_metrics = {
             id(net): self._build_reference_metrics(net)
-            for net in self.nets
+            for net in self.metric_nets
         }
 
     def close(self) -> None:
@@ -166,7 +170,7 @@ class RewardEvaluator:
     def evaluate(self, temporary_locations: Dict[str, Point]) -> float:
         """Return weighted normalized reward for a complete candidate assignment."""
         total_reward = 0.0
-        for net in self.nets:
+        for net in self.metric_nets:
             reference = self.reference_metrics[id(net)]
             candidate_hpwl = net_hpwl(net, self.placedb, temporary_locations)
             wirelength_reward = self._normalized_improvement(reference.hpwl, candidate_hpwl)
@@ -288,6 +292,7 @@ class NetMetrics:
     """记录最终分配后单条 net 的 HPWL 与 feedthrough。"""
 
     net_id: int
+    pin_count: int
     hpwl: float
     feedthrough: float
 
@@ -444,6 +449,7 @@ def final_net_metrics(
     metrics = [
         NetMetrics(
             net_id=net.net_id,
+            pin_count=len(net.pins),
             hpwl=net_hpwl(net, placedb, {}),
             feedthrough=0.0,
         )
@@ -454,6 +460,8 @@ def final_net_metrics(
 
     if feedthrough_context is not None:
         for metric, net in zip(metrics, placedb.nets_list):
+            if len(net.pins) <= 1:
+                continue
             locations = {
                 pin.full_name: placedb.get_pin_location_estimate(pin)
                 for pin in net.pins
@@ -470,6 +478,8 @@ def final_net_metrics(
     modules_text = ftpred_loader.build_modules_text(placedb)
     with ftpred_loader.FtpredBinSession(str(executable), modules_text) as session:
         for metric, net in zip(metrics, placedb.nets_list):
+            if len(net.pins) <= 1:
+                continue
             # loader 会为每条 net 打印解析明细；最终报告已统一记录指标，
             # 这里收起内部进度输出，保持主程序输出简洁。
             with redirect_stdout(StringIO()):
@@ -480,14 +490,17 @@ def final_net_metrics(
 def summarize_metrics(metrics: List[NetMetrics]) -> Dict[str, float | int]:
     """汇总所有 net 指标，生成数量、总值和平均值。"""
     count = len(metrics)
+    metric_count = sum(1 for metric in metrics if metric.pin_count > 1)
     total_hpwl = sum(metric.hpwl for metric in metrics)
     total_feedthrough = sum(metric.feedthrough for metric in metrics)
     return {
         "net_count": count,
+        "metric_net_count": metric_count,
+        "skipped_single_pin_net_count": count - metric_count,
         "total_hpwl": total_hpwl,
-        "average_hpwl": total_hpwl / count if count else 0.0,
+        "average_hpwl": total_hpwl / metric_count if metric_count else 0.0,
         "total_feedthrough": total_feedthrough,
-        "average_feedthrough": total_feedthrough / count if count else 0.0,
+        "average_feedthrough": total_feedthrough / metric_count if metric_count else 0.0,
     }
 
 

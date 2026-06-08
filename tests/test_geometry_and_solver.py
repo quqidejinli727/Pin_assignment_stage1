@@ -7,7 +7,7 @@ from assignment_solver import AssignmentSolver
 from geometry_utils import align_vertices_to_reference
 from homology import HomologyManager
 from mcts import MCTSNode, MCTSSolver
-from scoring import RewardEvaluator, final_net_metrics
+from scoring import RewardEvaluator, final_net_metrics, summarize_metrics
 from segment import SegmentManager
 from PlaceDB import PlaceDB
 
@@ -182,6 +182,8 @@ def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
         basic_space_scale_divisor=10,
         basic_max_space_factor=10,
         basic_min_simulations=1,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     assert abs(mcts._total_search_space_factor(usage) - 6.4) < 1e-9
     assert mcts._basic_simulation_budget(usage) == 640
@@ -196,6 +198,8 @@ def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
         basic_space_scale_divisor=10,
         basic_max_space_factor=10,
         basic_min_simulations=1,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     assert doubled._basic_simulation_budget(usage) == 1280
 
@@ -209,6 +213,8 @@ def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
         basic_space_scale_divisor=1,
         basic_max_space_factor=5,
         basic_min_simulations=1,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     assert capped._total_search_space_factor(usage) == 5
     assert capped._basic_simulation_budget(usage) == 500
@@ -234,6 +240,8 @@ def test_mcts_search_space_ignores_already_assigned_groups(tmp_path):
         basic_space_scale_divisor=10,
         basic_max_space_factor=10,
         basic_min_simulations=1,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
         typical_depth=3,
         space_scale_divisor=10,
         max_space_factor=10,
@@ -261,6 +269,8 @@ def test_basic_mcts_dynamic_budget_has_floor_and_can_be_disabled(tmp_path):
         search_mode="basic",
         basic_space_scale_divisor=1_000_000,
         basic_min_simulations=256,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     assert abs(floored._total_search_space_factor(usage) - 0.000064) < 1e-12
     assert floored._basic_simulation_budget(usage) == 256
@@ -274,6 +284,8 @@ def test_basic_mcts_dynamic_budget_has_floor_and_can_be_disabled(tmp_path):
         search_mode="basic",
         basic_space_scale_divisor=1_000_000,
         basic_min_simulations=10,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     assert reduced._basic_simulation_budget(usage) == 10
 
@@ -285,8 +297,57 @@ def test_basic_mcts_dynamic_budget_has_floor_and_can_be_disabled(tmp_path):
         simulations=17,
         search_mode="basic",
         basic_dynamic_simulations=False,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     assert disabled._basic_simulation_budget(usage) == 17
+
+
+def test_basic_mcts_depth_overrides_and_depth1_bypasses_pruning(tmp_path):
+    """Depth-1/2 basic trees use manual budgets and depth-1 keeps all candidates."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    usage = segments.snapshot_usage()
+
+    depth1 = MCTSSolver(
+        placedb,
+        segments,
+        groups[:1],
+        placedb.nets_list,
+        simulations=4096,
+        search_mode="basic",
+        basic_depth1_simulations=32,
+        basic_depth2_simulations=256,
+        basic_disable_pruning_depth_limit=1,
+        candidate_min_count=1,
+        candidate_top_k=1,
+    )
+    depth1_profile = depth1._search_profile(usage)
+    assert depth1_profile.depth == 1
+    assert depth1._basic_simulation_budget(usage, depth1_profile) == 32
+
+    depth1._active_basic_depth = 1
+    raw_candidates = depth1._raw_feasible_segments(groups[0], usage)
+    pruned_candidates = depth1._candidate_segments(groups[0], usage)
+    assert len(raw_candidates) > 1
+    assert len(pruned_candidates) == len(raw_candidates)
+
+    depth2 = MCTSSolver(
+        placedb,
+        segments,
+        groups[:2],
+        placedb.nets_list,
+        simulations=4096,
+        search_mode="basic",
+        basic_depth1_simulations=32,
+        basic_depth2_simulations=256,
+    )
+    depth2_profile = depth2._search_profile(usage)
+    assert depth2_profile.depth == 2
+    assert depth2._basic_simulation_budget(usage, depth2_profile) == 256
 
 
 def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
@@ -306,6 +367,8 @@ def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
         basic_space_scale_divisor=10,
         basic_max_space_factor=10,
         basic_min_simulations=1,
+        basic_depth1_simulations=0,
+        basic_depth2_simulations=0,
     )
     expected = mcts._basic_simulation_budget(segments.snapshot_usage())
     calls = {"simulate": 0}
@@ -692,6 +755,87 @@ def test_final_net_metrics_can_reuse_feedthrough_context(tmp_path):
     assert len(metrics) == len(placedb.nets_list)
     assert len(context.calls) == len(placedb.nets_list)
     assert not context.closed
+
+
+def test_single_pin_nets_are_skipped_for_metric_feedthrough(tmp_path):
+    """Single-pin nets should remain in records but skip HPWL/FT evaluation work."""
+    block = {
+        "name": "TOP",
+        "module_name": "TOP",
+        "direction": 0,
+        "color": "#000000",
+        "vertex": [[0, 0], [100, 0], [100, 100], [0, 100]],
+        "children": [
+            {
+                "name": "TOP.U_A0",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_A1",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[60, 0], [70, 0], [70, 10], [60, 10]],
+                "children": [],
+            },
+        ],
+    }
+    pingroup = [
+        [
+            {
+                "parent_inst": "TOP.U_A0",
+                "parent_module": "A",
+                "pingroup_name": "single",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_A0",
+                "parent_module": "A",
+                "pingroup_name": "pair",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+            {
+                "parent_inst": "TOP.U_A1",
+                "parent_module": "A",
+                "pingroup_name": "pair",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+        ],
+    ]
+    block_path = tmp_path / "block.json"
+    pingroup_path = tmp_path / "pingroup.json"
+    block_path.write_text(json.dumps(block), encoding="utf-8")
+    pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
+
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    context = FakeFeedthroughContext()
+    metrics = final_net_metrics(
+        placedb,
+        tmp_path,
+        enable_feedthrough=True,
+        auto_build_feedthrough=False,
+        feedthrough_context=context,
+    )
+    summary = summarize_metrics(metrics)
+
+    assert len(metrics) == 2
+    assert [metric.pin_count for metric in metrics] == [1, 2]
+    assert len(context.calls) == 1
+    assert summary["net_count"] == 2
+    assert summary["metric_net_count"] == 1
+    assert summary["skipped_single_pin_net_count"] == 1
 
 
 def test_mcts_scaled_budget_and_tail_decay(tmp_path):
