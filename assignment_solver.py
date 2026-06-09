@@ -76,6 +76,7 @@ class AssignmentSolver:
         feedthrough_source_dir: str | Path | None = None,
         feedthrough_predict_source_dir: str | Path | None = None,
         feedthrough_evaluate_source_dir: str | Path | None = None,
+        feedthrough_reward_source: str = "predict",
         enable_feedthrough: bool = True,
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
@@ -111,6 +112,7 @@ class AssignmentSolver:
             if feedthrough_evaluate_source_dir
             else self.feedthrough_source_dir
         )
+        self.feedthrough_reward_source = feedthrough_reward_source
         self.auto_build_feedthrough = auto_build_feedthrough
         self.cmake_generator = cmake_generator
         self.feedthrough_context: FeedthroughContext | None = None
@@ -225,16 +227,29 @@ class AssignmentSolver:
             return
         if not self.enable_feedthrough or self.feedthrough_weight == 0.0:
             return
-        if self.feedthrough_predict_source_dir is None:
+        source_dir, role = self._feedthrough_reward_context_source()
+        if source_dir is None:
             raise ValueError(
-                "feedthrough_predict_source_dir is required when feedthrough reward is enabled."
+                f"feedthrough_{role}_source_dir is required when feedthrough reward is enabled."
             )
         self.feedthrough_context = FeedthroughContext(
             self.placedb,
-            self.feedthrough_predict_source_dir,
+            source_dir,
             auto_build_feedthrough=self.auto_build_feedthrough,
             cmake_generator=self.cmake_generator,
-            role="predict",
+            role=role,
+        )
+
+    def _feedthrough_reward_context_source(self) -> tuple[Path | None, str]:
+        """Return the configured feedthrough source directory and loader role for reward."""
+        source = self.feedthrough_reward_source.lower().strip()
+        if source == "predict":
+            return self.feedthrough_predict_source_dir, "predict"
+        if source == "evaluate":
+            return self.feedthrough_evaluate_source_dir, "evaluate"
+        raise ValueError(
+            "feedthrough_reward_source must be 'predict' or 'evaluate', "
+            f"got {self.feedthrough_reward_source!r}."
         )
 
     def close_feedthrough_context(self) -> None:
