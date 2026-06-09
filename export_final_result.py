@@ -208,16 +208,34 @@ def write_interface_result(
     placedb: PlaceDB,
     homology: HomologyManager,
     segments: SegmentManager,
+    timestamp: str | None = None,
 ) -> Path:
     """生成带时间戳的接口格式 JSON 文件并返回路径。"""
     directory = Path(output_dir)
     directory.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    timestamp = timestamp or datetime.now().strftime("%Y%m%d%H%M%S%f")
     path = directory / f"segment_assignments_{timestamp}.json"
     path.write_text(
         json.dumps(build_interface_result(placedb, homology, segments), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+    return path
+
+
+def write_config_record(
+    output_dir: str | Path,
+    config_record: dict,
+    timestamp: str,
+    result_path: str | Path | None = None,
+) -> Path:
+    """Write a timestamp-matched config record for one Stage1 interface result."""
+    directory = Path(output_dir)
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"stage1_config_{timestamp}.json"
+    record = dict(config_record)
+    if result_path is not None:
+        record["interface_result_path"] = str(result_path)
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
 
 

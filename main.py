@@ -10,7 +10,7 @@ from pathlib import Path
 
 from assignment_solver import AssignmentSolver
 from config import DEFAULT_CONFIG, RunConfig
-from export_final_result import write_interface_result
+from export_final_result import write_config_record, write_interface_result
 from scoring import metrics_to_records, summarize_metrics
 
 
@@ -203,12 +203,21 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         )
         report_path = write_run_report(config, assignment_result["summary"], metrics)
         interface_result_path = None
+        config_record_path = None
         if config.export_interface_result:
+            interface_timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
             interface_result_path = write_interface_result(
                 config.interface_result_dir,
                 solver.placedb,
                 solver.homology,
                 solver.segment_manager,
+                timestamp=interface_timestamp,
+            )
+            config_record_path = write_config_record(
+                config.interface_result_dir,
+                config.to_record(),
+                interface_timestamp,
+                result_path=interface_result_path,
             )
         print(json.dumps(assignment_result["summary"], ensure_ascii=False, indent=2))
         print(json.dumps(summarize_metrics(metrics), ensure_ascii=False, indent=2))
@@ -216,6 +225,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         print(f"Result report: {report_path}")
         if interface_result_path is not None:
             print(f"Interface result: {interface_result_path}")
+            print(f"Config record: {config_record_path}")
             return interface_result_path
         return config.assignment_output_path
     finally:
