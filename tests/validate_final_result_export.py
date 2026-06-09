@@ -12,7 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from assignment_solver import AssignmentSolver  # noqa: E402
-from export_final_result import build_interface_result  # noqa: E402
+from export_final_result import build_interface_result, write_config_record, write_interface_result  # noqa: E402
 from segment_subdivision import percentile_edge_length, subdivision_specs  # noqa: E402
 
 
@@ -113,6 +113,25 @@ def main() -> None:
         assert {pin["name"] for pin in pins} == set(solver.placedb.pin_dict)
         assert len({pin["net_id"] for pin in pins}) == 1
         assert len({pin["isomorphic_group_id"] for pin in pins}) == 1
+        timestamp = "20260609010203000000"
+        output_dir = Path(temporary_dir)
+        result_path = write_interface_result(
+            output_dir,
+            solver.placedb,
+            solver.homology,
+            solver.segment_manager,
+            timestamp=timestamp,
+        )
+        config_path = write_config_record(
+            output_dir,
+            {"simulations": 8},
+            timestamp,
+            result_path=result_path,
+        )
+        assert result_path.name == f"segment_assignments_{timestamp}.json"
+        assert config_path.name == f"stage1_config_{timestamp}.json"
+        config_record = json.loads(config_path.read_text(encoding="utf-8"))
+        assert config_record["interface_result_path"] == str(result_path)
         print(f"Final result export validation passed: {result['total_segments']} segments exported.")
 
 

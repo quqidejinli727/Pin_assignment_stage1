@@ -11,6 +11,7 @@ import logging
 import os
 import sys
 from dataclasses import replace
+from datetime import datetime
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ def run_mcts(
     """
     from assignment_solver import AssignmentSolver
     from config import DEFAULT_CONFIG
-    from export_final_result import write_interface_result
+    from export_final_result import write_config_record, write_interface_result
     from scoring import summarize_metrics
 
     output_path = Path(output_dir).resolve()
@@ -160,13 +161,20 @@ def run_mcts(
             summary["total_hpwl"],
             summary["total_feedthrough"],
         )
-        return str(
-            write_interface_result(
-                output_path,
-                solver.placedb,
-                solver.homology,
-                solver.segment_manager,
-            )
+        interface_timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
+        interface_result_path = write_interface_result(
+            output_path,
+            solver.placedb,
+            solver.homology,
+            solver.segment_manager,
+            timestamp=interface_timestamp,
         )
+        write_config_record(
+            output_path,
+            config.to_record(),
+            interface_timestamp,
+            result_path=interface_result_path,
+        )
+        return str(interface_result_path)
     finally:
         solver.close_feedthrough_context()
