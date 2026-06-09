@@ -98,7 +98,7 @@ class MCTSSolver:
         hybrid_enable_layer_early_stop: bool = True,
         hybrid_early_stop_std_multiplier: float = 2.0,
         hybrid_time_limit_seconds: float = 0.0,
-        hybrid_enable_ultradeep_profile: bool = True,
+        hybrid_enable_ultradeep_profile: bool = False,
         hybrid_ultradeep_depth: int = 100,
         hybrid_max_expanded_depth: int = 64,
         hybrid_ultradeep_beam_width: int = 1,
@@ -256,6 +256,8 @@ class MCTSSolver:
         profile = self._search_profile(root.usage)
         self.last_search_profile = profile
         self._active_basic_depth = profile.depth
+        if profile.depth == 1:
+            return self._search_depth1_greedy(root)
 
         for _ in range(self._basic_simulation_budget(root.usage, profile)):
             node = self._select(root)
@@ -268,6 +270,15 @@ class MCTSSolver:
         if best is None:
             return self._greedy_assignment(root.usage)
         return self._extract_best_path(best)
+
+    def _search_depth1_greedy(self, root: MCTSNode) -> Dict[str, str]:
+        """For a one-layer tree, exhaustively score all candidates with the full reward."""
+        group = self.groups[0]
+        feasible = self._candidate_segments(group, root.usage)
+        if not feasible:
+            return self._greedy_assignment(root.usage)
+        segment = self._best_completion_segment_by_reward(group, feasible, root.assignments)
+        return {group.name: segment.segment_id}
 
     def _search_hybrid(self) -> Dict[str, str]:
         """Run adaptive Hybrid search: Basic for small trees, beam-layered otherwise."""

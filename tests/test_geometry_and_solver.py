@@ -459,6 +459,55 @@ def test_basic_mcts_depth_overrides_and_depth1_bypasses_pruning(tmp_path):
     assert depth2._basic_simulation_budget(usage, depth2_profile) == 256
 
 
+def test_basic_depth1_search_uses_reward_greedy_without_simulation(tmp_path):
+    """Depth-1 basic search should score all candidates directly with the reward evaluator."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group = homology.pin_groups["A.p"]
+    candidates = segments.candidates_for_module(group.module_name)
+    preferred = candidates[-1]
+    preferred_points = {
+        preferred.instances[pin.parent_inst].midpoint
+        for pin in group.pins
+    }
+
+    class FakeRewardEvaluator:
+        def __init__(self):
+            self.calls = 0
+
+        def evaluate(self, temporary_locations):
+            self.calls += 1
+            points = set(temporary_locations.values())
+            return 10.0 if preferred_points <= points else 0.0
+
+        def close(self):
+            pass
+
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group],
+        placedb.nets_list,
+        simulations=4096,
+        search_mode="basic",
+        enable_candidate_pruning=True,
+        candidate_min_count=1,
+        candidate_top_k=1,
+    )
+    fake_evaluator = FakeRewardEvaluator()
+    mcts.reward_evaluator = fake_evaluator
+    mcts._simulate = lambda _node: (_ for _ in ()).throw(
+        AssertionError("depth-1 search should not run simulations")
+    )
+
+    assignment = mcts.search()
+
+    assert assignment == {group.name: preferred.segment_id}
+    assert fake_evaluator.calls == len(candidates)
+
+
 def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
     """Basic search should run exactly the dynamic budget number of simulations."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -597,6 +646,7 @@ def test_hybrid_ultradeep_limits_expanded_depth_and_fast_completes(tmp_path):
         search_mode="hybrid",
         hybrid_basic_depth_limit=0,
         hybrid_ultradeep_depth=20,
+        hybrid_enable_ultradeep_profile=True,
         hybrid_max_expanded_depth=5,
         hybrid_ultradeep_beam_width=1,
         hybrid_ultradeep_min_layer_simulations=1,
@@ -901,7 +951,7 @@ def test_assignment_solver_selects_feedthrough_reward_source(tmp_path):
         assignment_solver_module.FeedthroughContext = original_context
 
     assert created[0] == (evaluate_dir, "evaluate")
-    assert created[1] == (evaluate_dir, "evaluate")
+    assert created[1] == (predict_dir, "predict")
 
 
 def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):
