@@ -176,6 +176,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         feedthrough_source_dir=config.feedthrough_source_dir,
         feedthrough_predict_source_dir=config.feedthrough_predict_source_dir,
         feedthrough_evaluate_source_dir=config.feedthrough_evaluate_source_dir,
+        feedthrough_reward_source=config.feedthrough_reward_source,
         enable_feedthrough=config.enable_feedthrough,
         auto_build_feedthrough=config.auto_build_feedthrough,
         cmake_generator=config.cmake_generator,

@@ -668,6 +668,52 @@ def test_assignment_solver_creates_one_feedthrough_context(tmp_path):
     assert created_contexts[0].closed
 
 
+def test_assignment_solver_selects_feedthrough_reward_source(tmp_path):
+    """Reward FT context can use predict or evaluate source according to config."""
+    block_path, pingroup_path = write_case(tmp_path)
+    created = []
+
+    class FakeContext(FakeFeedthroughContext):
+        def __init__(self, _placedb, source_dir, **kwargs):
+            super().__init__()
+            created.append((Path(source_dir), kwargs.get("role")))
+
+    original_context = assignment_solver_module.FeedthroughContext
+    assignment_solver_module.FeedthroughContext = FakeContext
+    try:
+        predict_dir = tmp_path / "predict"
+        evaluate_dir = tmp_path / "evaluate"
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            feedthrough_weight=1.0,
+            feedthrough_predict_source_dir=predict_dir,
+            feedthrough_evaluate_source_dir=evaluate_dir,
+            feedthrough_reward_source="evaluate",
+            enable_feedthrough=True,
+        )
+        solver.solve()
+        solver.close_feedthrough_context()
+
+        default_solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            feedthrough_weight=1.0,
+            feedthrough_predict_source_dir=predict_dir,
+            feedthrough_evaluate_source_dir=evaluate_dir,
+            enable_feedthrough=True,
+        )
+        default_solver.solve()
+        default_solver.close_feedthrough_context()
+    finally:
+        assignment_solver_module.FeedthroughContext = original_context
+
+    assert created[0] == (evaluate_dir, "evaluate")
+    assert created[1] == (predict_dir, "predict")
+
+
 def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):
     """No shared FT context should be opened when feedthrough reward weight is zero."""
     block_path, pingroup_path = write_case(tmp_path)

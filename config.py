@@ -42,6 +42,8 @@ class RunConfig:
     feedthrough_predict_source_dir: Path = PROJECT_DIR / "feedthrough_predict"
     # Stage1 最终指标统计使用的 feedthrough 评估器路径，可为可执行文件或包含 build/ftpred 的目录。
     feedthrough_evaluate_source_dir: Path = PROJECT_DIR / "feedthrough_evaluate"
+    # MCTS reward 阶段使用的 feedthrough 来源，可选 "predict" 或 "evaluate"；默认使用预测器。
+    feedthrough_reward_source: str = "predict"
     # 最终指标和非零 feedthrough reward 是否启用 feedthrough 预测/评估。
     enable_feedthrough: bool = True
     # 找不到 ftpred 可执行文件时是否自动调用 CMake 编译；默认关闭，要求预先编译好。
