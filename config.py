@@ -42,8 +42,8 @@ class RunConfig:
     feedthrough_predict_source_dir: Path = PROJECT_DIR / "feedthrough_predict"
     # Stage1 最终指标统计使用的 feedthrough 评估器路径，可为可执行文件或包含 build/ftpred 的目录。
     feedthrough_evaluate_source_dir: Path = PROJECT_DIR / "feedthrough_evaluate"
-    # MCTS reward 阶段使用的 feedthrough 来源，可选 "predict" 或 "evaluate"；默认使用预测器。
-    feedthrough_reward_source: str = "predict"
+    # MCTS reward 阶段使用的 feedthrough 来源，可选 "predict" 或 "evaluate"；默认使用评估器。
+    feedthrough_reward_source: str = "evaluate"
     # 最终指标和非零 feedthrough reward 是否启用 feedthrough 预测/评估。
     enable_feedthrough: bool = True
     # 找不到 ftpred 可执行文件时是否自动调用 CMake 编译；默认关闭，要求预先编译好。
@@ -126,6 +126,8 @@ class RunConfig:
     mcts_hybrid_early_stop_std_multiplier: float = 2.0
     # Hybrid 单棵树 wall-clock 时间上限；0 表示关闭，仅作为后续接口预留。
     mcts_hybrid_time_limit_seconds: float = 0.0
+    # 是否启用 Hybrid 超深树 profile；关闭时超深树继续使用原 hybrid beam/tail 流程。
+    mcts_hybrid_enable_ultradeep_profile: bool = True
     # Hybrid 超深树阈值；超过该深度后以“前缀搜索 + 快速补全”为主，避免 100+ 到 2000 深度逐层耗时失控。
     mcts_hybrid_ultradeep_depth: int = 100
     # Hybrid 超深树最多展开搜索的前缀深度，剩余同构组走快速补全。

@@ -98,6 +98,7 @@ class MCTSSolver:
         hybrid_enable_layer_early_stop: bool = True,
         hybrid_early_stop_std_multiplier: float = 2.0,
         hybrid_time_limit_seconds: float = 0.0,
+        hybrid_enable_ultradeep_profile: bool = True,
         hybrid_ultradeep_depth: int = 100,
         hybrid_max_expanded_depth: int = 64,
         hybrid_ultradeep_beam_width: int = 1,
@@ -156,6 +157,7 @@ class MCTSSolver:
         self.hybrid_enable_layer_early_stop = hybrid_enable_layer_early_stop
         self.hybrid_early_stop_std_multiplier = hybrid_early_stop_std_multiplier
         self.hybrid_time_limit_seconds = hybrid_time_limit_seconds
+        self.hybrid_enable_ultradeep_profile = hybrid_enable_ultradeep_profile
         self.hybrid_ultradeep_depth = hybrid_ultradeep_depth
         self.hybrid_max_expanded_depth = hybrid_max_expanded_depth
         self.hybrid_ultradeep_beam_width = max(1, hybrid_ultradeep_beam_width)
@@ -442,7 +444,11 @@ class MCTSSolver:
 
     def _hybrid_uses_ultradeep_profile(self, profile: SearchProfile) -> bool:
         """Return whether Hybrid should use the ultra-deep bounded prefix profile."""
-        return self.hybrid_ultradeep_depth > 0 and profile.depth >= self.hybrid_ultradeep_depth
+        return (
+            self.hybrid_enable_ultradeep_profile
+            and self.hybrid_ultradeep_depth > 0
+            and profile.depth >= self.hybrid_ultradeep_depth
+        )
 
     def _hybrid_expanded_depth(self, profile: SearchProfile) -> int:
         """Return how many layers Hybrid should explicitly search before completion."""

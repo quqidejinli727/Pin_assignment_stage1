@@ -630,6 +630,37 @@ def test_hybrid_ultradeep_limits_expanded_depth_and_fast_completes(tmp_path):
     assert set(assignment) == {group.name for group in base_groups}
 
 
+def test_hybrid_can_disable_ultradeep_profile(tmp_path):
+    """Disabling the ultra-deep profile should fall back to the prior hybrid route."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups() * 8
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=10,
+        search_mode="hybrid",
+        hybrid_basic_depth_limit=0,
+        hybrid_enable_ultradeep_profile=False,
+        hybrid_ultradeep_depth=5,
+        hybrid_min_layer_simulations=1,
+        hybrid_max_layer_simulations=1,
+        hybrid_max_tree_simulations=3,
+        hybrid_enable_layer_early_stop=False,
+        enable_candidate_pruning=False,
+    )
+
+    mcts._simulate = lambda _node: 1.0
+    mcts.search()
+
+    assert mcts.last_search_diagnostics["route"] != "ultradeep"
+    assert mcts.last_search_diagnostics["expanded_depth"] == len(groups)
+
+
 def test_candidate_pruning_is_safe_and_disableable(tmp_path):
     """Candidate pruning should keep a non-empty subset and be fully disableable."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -870,7 +901,7 @@ def test_assignment_solver_selects_feedthrough_reward_source(tmp_path):
         assignment_solver_module.FeedthroughContext = original_context
 
     assert created[0] == (evaluate_dir, "evaluate")
-    assert created[1] == (predict_dir, "predict")
+    assert created[1] == (evaluate_dir, "evaluate")
 
 
 def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):

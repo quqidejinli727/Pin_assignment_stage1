@@ -121,6 +121,7 @@ def run_mcts(
         mcts_hybrid_enable_layer_early_stop=config.mcts_hybrid_enable_layer_early_stop,
         mcts_hybrid_early_stop_std_multiplier=config.mcts_hybrid_early_stop_std_multiplier,
         mcts_hybrid_time_limit_seconds=config.mcts_hybrid_time_limit_seconds,
+        mcts_hybrid_enable_ultradeep_profile=config.mcts_hybrid_enable_ultradeep_profile,
         mcts_hybrid_ultradeep_depth=config.mcts_hybrid_ultradeep_depth,
         mcts_hybrid_max_expanded_depth=config.mcts_hybrid_max_expanded_depth,
         mcts_hybrid_ultradeep_beam_width=config.mcts_hybrid_ultradeep_beam_width,
