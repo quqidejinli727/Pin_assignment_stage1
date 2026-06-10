@@ -69,9 +69,13 @@ def analyze_batches(
     pingroup_json: str | Path,
     coverage_threshold: float = DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
     min_committable_group_ratio: float = DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
+    use_fanout_reuse_for_sorting: bool = DEFAULT_CONFIG.homology_use_fanout_reuse_for_sorting,
 ) -> dict:
     placedb = PlaceDB(str(block_json), str(pingroup_json))
-    homology = HomologyManager(placedb)
+    homology = HomologyManager(
+        placedb,
+        use_fanout_reuse_for_sorting=use_fanout_reuse_for_sorting,
+    )
 
     tree_reports: List[dict] = []
     skipped_tree_reports: List[dict] = []
@@ -192,6 +196,7 @@ def analyze_batches(
             "pingroup_json": str(Path(pingroup_json)),
         },
         "parameters": {
+            "use_fanout_reuse_for_sorting": use_fanout_reuse_for_sorting,
             "coverage_threshold": coverage_threshold,
             "min_committable_group_ratio": min_committable_group_ratio,
         },
@@ -269,6 +274,12 @@ def main() -> None:
         help="Pin coverage ratio required for a homology group to be committable.",
     )
     parser.add_argument(
+        "--fanout-reuse-sorting",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CONFIG.homology_use_fanout_reuse_for_sorting,
+        help="Whether multi-fanout pins boost homology sorting reuse count.",
+    )
+    parser.add_argument(
         "--min-committable-group-ratio",
         type=float,
         default=DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
@@ -279,6 +290,7 @@ def main() -> None:
     report = analyze_batches(
         args.block,
         args.pingroup,
+        use_fanout_reuse_for_sorting=args.fanout_reuse_sorting,
         coverage_threshold=args.coverage_threshold,
         min_committable_group_ratio=args.min_committable_group_ratio,
     )

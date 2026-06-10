@@ -127,6 +127,134 @@ def test_placedb_indexes_and_segment_mapping(tmp_path):
     assert ("TOP.U_A1", "A:S0") in segments.instance_lookup
 
 
+def write_fanout_sort_case(tmp_path: Path) -> tuple[Path, Path]:
+    """Create repeated pin records where successors reveal multi-fanout reuse."""
+    block = {
+        "name": "TOP",
+        "module_name": "TOP",
+        "direction": 0,
+        "color": "#000000",
+        "vertex": [[0, 0], [140, 0], [140, 80], [0, 80]],
+        "children": [
+            {
+                "name": "TOP.U_A0",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[0, 0], [10, 0], [10, 10], [0, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_B0",
+                "module_name": "B",
+                "direction": 0,
+                "color": "#bbbbbb",
+                "vertex": [[30, 0], [40, 0], [40, 10], [30, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_B1",
+                "module_name": "B",
+                "direction": 0,
+                "color": "#bbbbbb",
+                "vertex": [[50, 0], [60, 0], [60, 10], [50, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_C0",
+                "module_name": "C",
+                "direction": 0,
+                "color": "#cccccc",
+                "vertex": [[80, 0], [90, 0], [90, 10], [80, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_C1",
+                "module_name": "C",
+                "direction": 0,
+                "color": "#cccccc",
+                "vertex": [[100, 0], [110, 0], [110, 10], [100, 10]],
+                "children": [],
+            },
+        ],
+    }
+    pingroup = [
+        [
+            {
+                "parent_inst": "TOP.U_A0",
+                "parent_module": "A",
+                "pingroup_name": "fan",
+                "scope": [],
+                "successors": ["TOP.U_B0.p"],
+                "width": 1.0,
+            },
+            {
+                "parent_inst": "TOP.U_B0",
+                "parent_module": "B",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_A0",
+                "parent_module": "A",
+                "pingroup_name": "fan",
+                "scope": [],
+                "successors": ["TOP.U_B1.p"],
+                "width": 1.0,
+            },
+            {
+                "parent_inst": "TOP.U_B1",
+                "parent_module": "B",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_C0",
+                "parent_module": "C",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+            {
+                "parent_inst": "TOP.U_C1",
+                "parent_module": "C",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+        ],
+    ]
+    block_path = tmp_path / "block.json"
+    pingroup_path = tmp_path / "pingroup.json"
+    block_path.write_text(json.dumps(block), encoding="utf-8")
+    pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
+    return block_path, pingroup_path
+
+
+def test_fanout_reuse_sorting_can_be_disabled(tmp_path):
+    """Multi-fanout pins can either boost reuse sorting or be treated as ordinary pins."""
+    block_path, pingroup_path = write_fanout_sort_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+
+    fanout_homology = HomologyManager(placedb, use_fanout_reuse_for_sorting=True)
+    ordinary_homology = HomologyManager(placedb, use_fanout_reuse_for_sorting=False)
+
+    assert fanout_homology.pin_groups["A.fan"].sort_reuse_count == 2
+    assert ordinary_homology.pin_groups["A.fan"].sort_reuse_count == 1
+    assert fanout_homology.unassigned_groups()[0].name == "A.fan"
+    assert ordinary_homology.unassigned_groups()[0].name == "B.p"
+
+
 def test_solver_assigns_all_pins_and_respects_capacity(tmp_path):
     """验证正常场景下所有 Pin 都完成分配且不超容量。"""
     block_path, pingroup_path = write_case(tmp_path)
@@ -1085,7 +1213,7 @@ def test_assignment_solver_selects_feedthrough_reward_source(tmp_path):
         assignment_solver_module.FeedthroughContext = original_context
 
     assert created[0] == (evaluate_dir, "evaluate")
-    assert created[1] == (predict_dir, "predict")
+    assert created[1] == (evaluate_dir, "evaluate")
 
 
 def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):

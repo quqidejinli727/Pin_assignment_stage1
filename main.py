@@ -171,6 +171,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         mcts_hybrid_ultradeep_min_layer_simulations=config.mcts_hybrid_ultradeep_min_layer_simulations,
         mcts_hybrid_ultradeep_max_layer_simulations=config.mcts_hybrid_ultradeep_max_layer_simulations,
         mcts_hybrid_use_fast_completion_for_ultradeep=config.mcts_hybrid_use_fast_completion_for_ultradeep,
+        homology_use_fanout_reuse_for_sorting=config.homology_use_fanout_reuse_for_sorting,
         homology_group_commit_coverage_threshold=config.homology_group_commit_coverage_threshold,
         mcts_tree_min_committable_group_ratio=config.mcts_tree_min_committable_group_ratio,
         mcts_enable_candidate_pruning=config.mcts_enable_candidate_pruning,

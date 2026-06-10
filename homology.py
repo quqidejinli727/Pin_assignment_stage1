@@ -18,6 +18,7 @@ class PinHomologyGroup:
     assigned: bool = False
     assigned_segment_id: str | None = None
     score: float = 0.0
+    sort_reuse_count: int = 0
 
     @property
     def reuse_count(self) -> int:
@@ -38,9 +39,10 @@ class PinHomologyGroup:
 class HomologyManager:
     """构建同构 Pin 组，并按任务规则计算处理顺序。"""
 
-    def __init__(self, placedb: PlaceDB):
+    def __init__(self, placedb: PlaceDB, use_fanout_reuse_for_sorting: bool = True):
         """根据 PlaceDB 的 Pin 索引初始化同构组和反向查询表。"""
         self.placedb = placedb
+        self.use_fanout_reuse_for_sorting = use_fanout_reuse_for_sorting
         self.pin_groups: Dict[str, PinHomologyGroup] = {
             name: PinHomologyGroup(name=name, pins=pins)
             for name, pins in placedb.pins_by_homology.items()
@@ -57,7 +59,8 @@ class HomologyManager:
         """计算同构组优先级分数，并返回排序后的组名列表。"""
         scored_names = []
         for group in self.pin_groups.values():
-            reuse_score = float(group.reuse_count)
+            group.sort_reuse_count = self._group_sort_reuse_count(group)
+            reuse_score = float(group.sort_reuse_count)
             fanout_score = 0.0
             hpwl_score = self._group_hpwl_score(group)
             # Fanout score is intentionally present but weight 0 for v1.
@@ -66,11 +69,28 @@ class HomologyManager:
         return sorted(
             scored_names,
             key=lambda name: (
-                -self.pin_groups[name].reuse_count,
+                -self.pin_groups[name].sort_reuse_count,
                 -self.pin_groups[name].score,
                 name,
             ),
         )
+
+    def _group_sort_reuse_count(self, group: PinHomologyGroup) -> int:
+        """Return the reuse count used only for homology processing order."""
+        pin_successors: Dict[str, Set[str]] = {}
+        pin_seen_count: Dict[str, int] = {}
+        for pin in group.pins:
+            pin_seen_count[pin.full_name] = pin_seen_count.get(pin.full_name, 0) + 1
+            pin_successors.setdefault(pin.full_name, set()).update(pin.successors)
+
+        if not self.use_fanout_reuse_for_sorting:
+            return len(pin_seen_count)
+
+        total = 0
+        for full_name, seen_count in pin_seen_count.items():
+            successor_count = len(pin_successors.get(full_name, set()))
+            total += max(seen_count, successor_count, 1)
+        return total
 
     def _group_hpwl_score(self, group: PinHomologyGroup) -> float:
         """用相关 Net 的模块质心 HPWL 估算该组的布线影响。"""

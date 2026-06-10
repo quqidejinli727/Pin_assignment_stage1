@@ -42,8 +42,8 @@ class RunConfig:
     feedthrough_predict_source_dir: Path = PROJECT_DIR / "feedthrough_predict"
     # Stage1 最终指标统计使用的 feedthrough 评估器路径，可为可执行文件或包含 build/ftpred 的目录。
     feedthrough_evaluate_source_dir: Path = PROJECT_DIR / "feedthrough_evaluate"
-    # MCTS reward 阶段使用的 feedthrough 来源，可选 "predict" 或 "evaluate"；默认使用预测器。
-    feedthrough_reward_source: str = "predict"
+    # MCTS reward 阶段使用的 feedthrough 来源，可选 "predict" 或 "evaluate"。
+    feedthrough_reward_source: str = "evaluate"
     # 最终指标和非零 feedthrough reward 是否启用 feedthrough 预测/评估。
     enable_feedthrough: bool = True
     # 找不到 ftpred 可执行文件时是否自动调用 CMake 编译；默认关闭，要求预先编译好。
@@ -71,13 +71,13 @@ class RunConfig:
     # Basic 模式动态模拟次数放大因子的上限。
     mcts_basic_max_space_factor: float = 8.0
     # Basic 模式动态模拟次数下限。
-    mcts_basic_min_simulations: int = 512
+    mcts_basic_min_simulations: int = 1024
     # Basic/basic-like 模式中深度为 1 的局部树使用的固定模拟次数；该类树默认不做候选剪枝。
     mcts_basic_depth1_simulations: int = 32
     # Basic/basic-like 模式中深度为 2 的局部树使用的固定模拟次数。
-    mcts_basic_depth2_simulations: int = 256
+    mcts_basic_depth2_simulations: int = 512
     # Basic/basic-like 模式中深度小于等于该值时关闭候选剪枝，避免单层选择误剪最优候选。
-    mcts_basic_disable_pruning_depth_limit: int = 1
+    mcts_basic_disable_pruning_depth_limit: int = 2
 
     # ===== Layered 模式设置 =====
     # Layered 模式逐层预算衰减系数。
@@ -143,6 +143,8 @@ class RunConfig:
     mcts_hybrid_use_fast_completion_for_ultradeep: bool = True
 
     # ===== 同构组提交设置 =====
+    # 是否在同构组排序时把多扇出 Pin 按 successors 连接数视为更高复用次数；关闭时只按唯一物理 Pin 数排序。
+    homology_use_fanout_reuse_for_sorting: bool = True
     # 当前 pins_in 覆盖同构组 Pin 比例达到该阈值时，允许直接提交整组到同一 segment；1 表示仅完整覆盖才提交。
     homology_group_commit_coverage_threshold: float = 1.0
     # 可提交同构组数占当前 MCTS 搜索同构组数比例不超过该值时，跳过当前 MCTS 树。
@@ -152,19 +154,19 @@ class RunConfig:
     # 是否启用候选 segment 预剪枝，减少大分支树搜索空间。
     mcts_enable_candidate_pruning: bool = True
     # 普通树候选剪枝保留的 top-K 数量。
-    mcts_candidate_top_k: int = 10
+    mcts_candidate_top_k: int = 12
     # 长尾/超大树候选剪枝保留的 top-K 数量。
-    mcts_candidate_tail_top_k: int = 6
+    mcts_candidate_tail_top_k: int = 8
     # 候选数量小于该阈值时不剪枝。
-    mcts_candidate_min_count: int = 12
+    mcts_candidate_min_count: int = 16
     # 与最佳候选分数差距在该比例内的候选额外保留，避免过度剪枝。
     mcts_candidate_score_tolerance: float = 0.03
 
     # ===== Reward 设置 =====
     # reward 中归一化 HPWL improvement 的权重。
-    wirelength_reward_weight: float = 1.0
+    wirelength_reward_weight: float = 0.9
     # reward 中归一化 feedthrough improvement 的权重；0 表示 MCTS 不计算 FT reward。
-    feedthrough_weight: float = 0.0
+    feedthrough_weight: float = 0.1
     # reward 归一化分母下限，避免参考值为 0 或过小。
     reward_normalization_floor: float = 1.0
     # 最终 reward 整体放大系数，用于调整 UCB exploitation 量级。
