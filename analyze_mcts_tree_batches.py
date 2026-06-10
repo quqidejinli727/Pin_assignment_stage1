@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 from PlaceDB import Net, Pin, PlaceDB
+from config import DEFAULT_CONFIG
 from homology import HomologyManager, PinHomologyGroup
 
 
@@ -47,13 +48,36 @@ def _ratio(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
 
 
-def analyze_batches(block_json: str | Path, pingroup_json: str | Path) -> dict:
+def _committable_groups(
+    groups: Iterable[PinHomologyGroup],
+    pin_full_names: set[str],
+    coverage_threshold: float,
+) -> List[PinHomologyGroup]:
+    threshold = max(0.0, min(1.0, coverage_threshold))
+    committable = []
+    for group in groups:
+        if not group.pins:
+            continue
+        covered_count = sum(1 for pin in group.pins if pin.full_name in pin_full_names)
+        if _ratio(covered_count, len(group.pins)) >= threshold:
+            committable.append(group)
+    return committable
+
+
+def analyze_batches(
+    block_json: str | Path,
+    pingroup_json: str | Path,
+    coverage_threshold: float = DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
+    min_committable_group_ratio: float = DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
+) -> dict:
     placedb = PlaceDB(str(block_json), str(pingroup_json))
     homology = HomologyManager(placedb)
 
     tree_reports: List[dict] = []
+    skipped_tree_reports: List[dict] = []
     non_mcts_assignments: List[dict] = []
     tree_index = 0
+    candidate_tree_index = 0
 
     for seed_group in homology.unassigned_groups():
         if seed_group.assigned:
@@ -89,7 +113,11 @@ def analyze_batches(block_json: str | Path, pingroup_json: str | Path) -> dict:
             continue
 
         pin_full_names = {pin.full_name for pin in pins_in}
-        committable_groups = homology.fully_contained_groups(related_groups, pin_full_names)
+        committable_groups = _committable_groups(
+            related_groups,
+            pin_full_names,
+            coverage_threshold,
+        )
         committable_group_names = {group.name for group in committable_groups}
         deferred_groups = [
             group for group in related_groups if group.name not in committable_group_names
@@ -98,36 +126,49 @@ def analyze_batches(block_json: str | Path, pingroup_json: str | Path) -> dict:
         search_group_count = len(related_groups)
         search_pin_count = _group_pin_count(related_groups)
         committable_pin_count = _group_pin_count(committable_groups)
+        committable_group_ratio = _ratio(len(committable_groups), search_group_count)
         pins_in_count = len(pin_full_names)
 
-        tree_reports.append(
-            {
-                "tree_index": tree_index,
-                "seed_group": seed_group.name,
-                "related_net_count": len(nets),
-                "related_net_ids": [net.net_id for net in nets],
-                "pins_in_count": pins_in_count,
-                "mcts_depth": search_group_count,
-                "search_group_count": search_group_count,
-                "search_pin_count": search_pin_count,
-                "committable_group_count": len(committable_groups),
-                "committable_pin_count": committable_pin_count,
-                "committable_pin_ratio_of_search_pins": _ratio(
-                    committable_pin_count,
-                    search_pin_count,
-                ),
-                "committable_pin_ratio_of_pins_in": _ratio(
-                    committable_pin_count,
-                    pins_in_count,
-                ),
-                "deferred_group_count": len(deferred_groups),
-                "deferred_pin_count": _group_pin_count(deferred_groups),
-                "search_groups": _group_records(related_groups),
-                "committable_groups": _group_records(committable_groups),
-                "deferred_groups": _group_records(deferred_groups),
-            }
-        )
+        report = {
+            "candidate_tree_index": candidate_tree_index,
+            "tree_index": tree_index,
+            "seed_group": seed_group.name,
+            "related_net_count": len(nets),
+            "related_net_ids": [net.net_id for net in nets],
+            "pins_in_count": pins_in_count,
+            "mcts_depth": search_group_count,
+            "search_group_count": search_group_count,
+            "search_pin_count": search_pin_count,
+            "committable_group_count": len(committable_groups),
+            "committable_pin_count": committable_pin_count,
+            "committable_group_ratio_of_search_groups": committable_group_ratio,
+            "committable_pin_ratio_of_search_pins": _ratio(
+                committable_pin_count,
+                search_pin_count,
+            ),
+            "committable_pin_ratio_of_pins_in": _ratio(
+                committable_pin_count,
+                pins_in_count,
+            ),
+            "deferred_group_count": len(deferred_groups),
+            "deferred_pin_count": _group_pin_count(deferred_groups),
+            "skipped_by_low_committable_ratio": (
+                committable_group_ratio <= min_committable_group_ratio
+            ),
+            "search_groups": _group_records(related_groups),
+            "committable_groups": _group_records(committable_groups),
+            "deferred_groups": _group_records(deferred_groups),
+        }
+
+        if report["skipped_by_low_committable_ratio"]:
+            report["tree_index"] = None
+            skipped_tree_reports.append(report)
+            candidate_tree_index += 1
+            continue
+
+        tree_reports.append(report)
         tree_index += 1
+        candidate_tree_index += 1
 
         for group in committable_groups:
             homology.mark_assigned(group, f"simulated_tree_{tree_index - 1}")
@@ -142,11 +183,17 @@ def analyze_batches(block_json: str | Path, pingroup_json: str | Path) -> dict:
     final_greedy_pin_count = _group_pin_count(final_greedy_groups)
     total_search_pin_count = sum(search_pin_values)
     total_committable_pin_count = sum(committable_pin_values)
+    skipped_search_group_count = sum(report["search_group_count"] for report in skipped_tree_reports)
+    skipped_search_pin_count = sum(report["search_pin_count"] for report in skipped_tree_reports)
 
     return {
         "input": {
             "block_json": str(Path(block_json)),
             "pingroup_json": str(Path(pingroup_json)),
+        },
+        "parameters": {
+            "coverage_threshold": coverage_threshold,
+            "min_committable_group_ratio": min_committable_group_ratio,
         },
         "summary": {
             "total_homology_group_count": len(homology.pin_groups),
@@ -155,10 +202,17 @@ def analyze_batches(block_json: str | Path, pingroup_json: str | Path) -> dict:
             "total_mcts_search_group_visits": sum(depth_values),
             "total_mcts_search_pin_visits": total_search_pin_count,
             "total_mcts_committable_pin_count": total_committable_pin_count,
+            "overall_committable_group_ratio_of_built_trees": _ratio(
+                sum(report["committable_group_count"] for report in tree_reports),
+                sum(report["search_group_count"] for report in tree_reports),
+            ),
             "overall_committable_ratio_of_search_pin_visits": _ratio(
                 total_committable_pin_count,
                 total_search_pin_count,
             ),
+            "skipped_mcts_tree_count": len(skipped_tree_reports),
+            "skipped_mcts_search_group_count": skipped_search_group_count,
+            "skipped_mcts_search_pin_count": skipped_search_pin_count,
             "final_greedy_group_count": len(final_greedy_groups),
             "final_greedy_pin_count": final_greedy_pin_count,
             "non_mcts_assignment_count": len(non_mcts_assignments),
@@ -173,6 +227,7 @@ def analyze_batches(block_json: str | Path, pingroup_json: str | Path) -> dict:
         },
         "depth_histogram": _histogram(depth_values),
         "tree_reports": tree_reports,
+        "skipped_tree_reports": skipped_tree_reports,
         "non_mcts_assignments": non_mcts_assignments,
         "final_greedy_groups": _group_records(final_greedy_groups),
     }
@@ -207,9 +262,26 @@ def main() -> None:
         default=".",
         help="Directory used when --output is not provided.",
     )
+    parser.add_argument(
+        "--coverage-threshold",
+        type=float,
+        default=DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
+        help="Pin coverage ratio required for a homology group to be committable.",
+    )
+    parser.add_argument(
+        "--min-committable-group-ratio",
+        type=float,
+        default=DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
+        help="Skip a candidate MCTS tree when committable/search group ratio is <= this value.",
+    )
     args = parser.parse_args()
 
-    report = analyze_batches(args.block, args.pingroup)
+    report = analyze_batches(
+        args.block,
+        args.pingroup,
+        coverage_threshold=args.coverage_threshold,
+        min_committable_group_ratio=args.min_committable_group_ratio,
+    )
     output_path = Path(args.output) if args.output else default_output_path(Path(args.output_dir))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

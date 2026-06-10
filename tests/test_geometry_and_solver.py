@@ -3,6 +3,7 @@ import math
 from pathlib import Path
 
 import assignment_solver as assignment_solver_module
+from analyze_mcts_tree_batches import analyze_batches
 from assignment_solver import AssignmentSolver
 from geometry_utils import align_vertices_to_reference
 from homology import HomologyManager
@@ -270,6 +271,139 @@ def test_partial_homology_group_can_commit_by_coverage_threshold(tmp_path):
     assert committed == 1
     assert group.assigned
     assert all(pin.assigned_segment_id == "A:S0" for pin in group.pins)
+
+
+def write_low_committable_case(tmp_path: Path) -> tuple[Path, Path]:
+    """Build a case where one net touches many partially covered homology groups."""
+    children = []
+    pingroup_net = []
+    singleton_nets = []
+    for index, module_name in enumerate(["A", "B", "C", "D"]):
+        for inst_index in range(2):
+            inst_name = f"TOP.U_{module_name}{inst_index}"
+            x0 = index * 30 + inst_index * 10
+            children.append(
+                {
+                    "name": inst_name,
+                    "module_name": module_name,
+                    "direction": 0,
+                    "color": "#aaaaaa",
+                    "vertex": [[x0, 0], [x0 + 8, 0], [x0 + 8, 8], [x0, 8]],
+                    "children": [],
+                }
+            )
+            pin = {
+                "parent_inst": inst_name,
+                "parent_module": module_name,
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+            if inst_index == 0:
+                pingroup_net.append(pin)
+            else:
+                singleton_nets.append([pin])
+    block = {
+        "name": "TOP",
+        "module_name": "TOP",
+        "direction": 0,
+        "color": "#000000",
+        "vertex": [[0, 0], [160, 0], [160, 80], [0, 80]],
+        "children": children,
+    }
+    pingroup = [pingroup_net] + singleton_nets
+    block_path = tmp_path / "block.json"
+    pingroup_path = tmp_path / "pingroup.json"
+    block_path.write_text(json.dumps(block), encoding="utf-8")
+    pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
+    return block_path, pingroup_path
+
+
+def test_low_committable_ratio_skips_mcts_tree(tmp_path):
+    """Low committable/search group ratio should skip MCTS without assigning the seed."""
+    block_path, pingroup_path = write_low_committable_case(tmp_path)
+
+    class FailingMCTS:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("low-ratio tree should not construct MCTS")
+
+    original_mcts = assignment_solver_module.MCTSSolver
+    assignment_solver_module.MCTSSolver = FailingMCTS
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            enable_segment_subdivision=False,
+            homology_group_commit_coverage_threshold=1.0,
+            mcts_tree_min_committable_group_ratio=0.3,
+        )
+        result = solver.solve()
+    finally:
+        assignment_solver_module.MCTSSolver = original_mcts
+
+    assert result["summary"]["skipped_mcts_tree_count"] == 4
+    assert result["summary"]["skipped_mcts_search_group_count"] == 16
+    assert result["summary"]["skipped_mcts_search_pin_count"] == 32
+    assert all(
+        item["committable_group_ratio"] <= 0.3
+        for item in result["skipped_mcts_trees"]
+    )
+    assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
+
+
+def test_high_committable_ratio_builds_mcts_tree(tmp_path):
+    """High committable/search group ratio should still invoke MCTS and commit groups."""
+    block_path, pingroup_path = write_case(tmp_path)
+    calls = {"mcts": 0}
+
+    class FakeMCTS:
+        def __init__(self, *args, **kwargs):
+            calls["mcts"] += 1
+
+        def search(self):
+            return {"A.p": "A:S0", "B.q": "B:S0", "B.r": "B:S0"}
+
+    original_mcts = assignment_solver_module.MCTSSolver
+    assignment_solver_module.MCTSSolver = FakeMCTS
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=2,
+            enable_segment_subdivision=False,
+            homology_group_commit_coverage_threshold=1.0,
+            mcts_tree_min_committable_group_ratio=0.3,
+        )
+        result = solver.solve()
+    finally:
+        assignment_solver_module.MCTSSolver = original_mcts
+
+    assert calls["mcts"] == 1
+    assert result["summary"]["skipped_mcts_tree_count"] == 0
+    assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
+
+
+def test_batch_analysis_uses_coverage_and_skip_thresholds(tmp_path):
+    """The analysis script should mirror low-ratio tree skipping."""
+    block_path, pingroup_path = write_low_committable_case(tmp_path)
+
+    report = analyze_batches(
+        block_path,
+        pingroup_path,
+        coverage_threshold=1.0,
+        min_committable_group_ratio=0.3,
+    )
+
+    assert report["summary"]["mcts_tree_count"] == 0
+    assert report["summary"]["skipped_mcts_tree_count"] == 4
+    assert report["summary"]["skipped_mcts_search_group_count"] == 16
+    assert report["summary"]["skipped_mcts_search_pin_count"] == 32
+    assert all(
+        item["skipped_by_low_committable_ratio"]
+        for item in report["skipped_tree_reports"]
+    )
 
 
 def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):

@@ -144,7 +144,9 @@ class RunConfig:
 
     # ===== 同构组提交设置 =====
     # 当前 pins_in 覆盖同构组 Pin 比例达到该阈值时，允许直接提交整组到同一 segment；1 表示仅完整覆盖才提交。
-    homology_group_commit_coverage_threshold: float = 0.5
+    homology_group_commit_coverage_threshold: float = 1.0
+    # 可提交同构组数占当前 MCTS 搜索同构组数比例不超过该值时，跳过当前 MCTS 树。
+    mcts_tree_min_committable_group_ratio: float = 0.3
 
     # ===== 候选剪枝设置 =====
     # 是否启用候选 segment 预剪枝，减少大分支树搜索空间。

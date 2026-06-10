@@ -129,6 +129,7 @@ def run_mcts(
         mcts_hybrid_ultradeep_max_layer_simulations=config.mcts_hybrid_ultradeep_max_layer_simulations,
         mcts_hybrid_use_fast_completion_for_ultradeep=config.mcts_hybrid_use_fast_completion_for_ultradeep,
         homology_group_commit_coverage_threshold=config.homology_group_commit_coverage_threshold,
+        mcts_tree_min_committable_group_ratio=config.mcts_tree_min_committable_group_ratio,
         mcts_enable_candidate_pruning=config.mcts_enable_candidate_pruning,
         mcts_candidate_top_k=config.mcts_candidate_top_k,
         mcts_candidate_tail_top_k=config.mcts_candidate_tail_top_k,
