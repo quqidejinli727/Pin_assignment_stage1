@@ -13,7 +13,7 @@ from dataclasses import asdict, dataclass
 from io import StringIO
 from pathlib import Path
 from types import ModuleType
-from typing import Callable, Dict, Iterable, List, Tuple
+from typing import Callable, Dict, Iterable, List, Set, Tuple
 
 from PlaceDB import Net, PlaceDB
 from geometry_utils import Point, hpwl
@@ -28,18 +28,20 @@ def net_hpwl(
     net: Net,
     placedb: PlaceDB,
     temporary_locations: Dict[str, Point],
+    skipped_pin_names: Set[str] | None = None,
 ) -> float:
-    """计算单条 Net 在临时 Pin 坐标下的 HPWL。"""
-    if len(net.pins) <= 1:
+    """Compute one net HPWL, optionally removing truly skipped pins."""
+    skipped_pin_names = skipped_pin_names or set()
+    active_pins = [pin for pin in net.pins if pin.full_name not in skipped_pin_names]
+    if len(active_pins) <= 1:
         return 0.0
     points = []
-    for pin in net.pins:
+    for pin in active_pins:
         if pin.full_name in temporary_locations:
             points.append(temporary_locations[pin.full_name])
         else:
             points.append(placedb.get_pin_location_estimate(pin))
     return hpwl(points)
-
 
 @dataclass
 class NetReferenceMetrics:
@@ -82,14 +84,27 @@ class FeedthroughContext:
             self.session.close()
             self.session = None
 
-    def run_one_net_at_locations(self, net: Net, locations: Dict[str, Point]) -> float:
+    def run_one_net_at_locations(
+        self,
+        net: Net,
+        locations: Dict[str, Point],
+        skipped_pin_names: Set[str] | None = None,
+    ) -> float:
         """Evaluate one net after temporarily applying the given pin locations."""
         if self.session is None:
             raise RuntimeError("FeedthroughContext has already been closed.")
 
+        skipped_pin_names = skipped_pin_names or set()
         old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
+        old_pin_scopes = [(pin, pin.scope) for pin in net.pins]
+        old_net_pins = list(net.pins)
         old_net_feedthrough = getattr(net, "feedthrough", 0.0)
         try:
+            if skipped_pin_names:
+                net.pins = [pin for pin in net.pins if pin.full_name not in skipped_pin_names]
+                for pin in old_net_pins:
+                    if pin.full_name in skipped_pin_names:
+                        pin.scope = []
             for pin in net.pins:
                 pin.x, pin.y = locations[pin.full_name]
             with redirect_stdout(StringIO()):
@@ -98,6 +113,9 @@ class FeedthroughContext:
             for pin, x, y in old_pin_locations:
                 pin.x = x
                 pin.y = y
+            for pin, scope in old_pin_scopes:
+                pin.scope = scope
+            net.pins = old_net_pins
             net.feedthrough = old_net_feedthrough
 
     def run_one_net_at_locations_cached(
@@ -105,13 +123,14 @@ class FeedthroughContext:
         net: Net,
         cache_key: Tuple[object, ...],
         locations_factory: Callable[[], Dict[str, Point]],
+        skipped_pin_names: Set[str] | None = None,
     ) -> float:
         """Evaluate one net with a full-flow cache and lazy location construction."""
         if cache_key in self.feedthrough_cache:
             self.cache_hits += 1
             return self.feedthrough_cache[cache_key]
         self.cache_misses += 1
-        value = self.run_one_net_at_locations(net, locations_factory())
+        value = self.run_one_net_at_locations(net, locations_factory(), skipped_pin_names)
         self.feedthrough_cache[cache_key] = value
         return value
 
@@ -130,6 +149,7 @@ class RewardEvaluator:
         normalization_floor: float = 1.0,
         reward_scale: float = 1.0,
         feedthrough_context: FeedthroughContext | None = None,
+        skipped_pin_names: Set[str] | None = None,
     ):
         self.nets = list(nets)
         self.placedb = placedb
@@ -139,18 +159,24 @@ class RewardEvaluator:
         self.normalization_floor = normalization_floor
         self.reward_scale = reward_scale
         self.feedthrough_context = feedthrough_context
-        self.metric_nets = [net for net in self.nets if len(net.pins) > 1]
+        self.skipped_pin_names = skipped_pin_names or set()
+        self.metric_nets = [net for net in self.nets if self._active_pin_count(net) > 1]
         self.skipped_single_pin_net_count = len(self.nets) - len(self.metric_nets)
         self._pin_estimate_cache: Dict[str, Point] = {}
         self._net_pins = {id(net): list(net.pins) for net in self.metric_nets}
         self._net_pin_names = {
-            id(net): {pin.full_name for pin in net.pins}
+            id(net): {
+                pin.full_name
+                for pin in net.pins
+                if pin.full_name not in self.skipped_pin_names
+            }
             for net in self.metric_nets
         }
         self._net_base_locations = {
             id(net): {
                 pin.full_name: self._pin_base_location(pin)
                 for pin in net.pins
+                if pin.full_name not in self.skipped_pin_names
             }
             for net in self.metric_nets
         }
@@ -172,7 +198,12 @@ class RewardEvaluator:
         total_reward = 0.0
         for net in self.metric_nets:
             reference = self.reference_metrics[id(net)]
-            candidate_hpwl = net_hpwl(net, self.placedb, temporary_locations)
+            candidate_hpwl = net_hpwl(
+                net,
+                self.placedb,
+                temporary_locations,
+                self.skipped_pin_names,
+            )
             wirelength_reward = self._normalized_improvement(reference.hpwl, candidate_hpwl)
 
             feedthrough_reward_value = 0.0
@@ -193,13 +224,20 @@ class RewardEvaluator:
         reference_locations = {
             pin.full_name: self.placedb.get_module(pin.parent_inst).get_centroid()
             for pin in net.pins
+            if pin.full_name not in self.skipped_pin_names
         }
-        reference_hpwl = net_hpwl(net, self.placedb, reference_locations)
+        reference_hpwl = net_hpwl(
+            net,
+            self.placedb,
+            reference_locations,
+            self.skipped_pin_names,
+        )
         reference_feedthrough = (
             self._feedthrough_at_locations(
                 net,
-                ("reference", id(net)),
+                ("reference", id(net), tuple(sorted(self.skipped_pin_names))),
                 lambda: reference_locations,
+                self.skipped_pin_names,
             )
             if self.enable_feedthrough
             else 0.0
@@ -221,11 +259,17 @@ class RewardEvaluator:
             rounded = self._rounded_point(point)
             if rounded != self._rounded_point(base_locations[pin_name]):
                 changed.append((pin_name, rounded))
-        key = ("candidate", net_id, tuple(sorted(changed)))
+        key = (
+            "candidate",
+            net_id,
+            tuple(sorted(self.skipped_pin_names)),
+            tuple(sorted(changed)),
+        )
         return self._feedthrough_at_locations(
             net,
             key,
             lambda: self._net_locations_from_changes(net, temporary_locations),
+            self.skipped_pin_names,
         )
 
     def _feedthrough_at_locations(
@@ -233,15 +277,29 @@ class RewardEvaluator:
         net: Net,
         cache_key: Tuple[object, ...],
         locations_factory: Callable[[], Dict[str, Point]],
+        skipped_pin_names: Set[str] | None = None,
     ) -> float:
         if self.feedthrough_context is None:
             return 0.0
         if not hasattr(self.feedthrough_context, "run_one_net_at_locations_cached"):
-            return self.feedthrough_context.run_one_net_at_locations(net, locations_factory())
+            if not skipped_pin_names:
+                return self.feedthrough_context.run_one_net_at_locations(net, locations_factory())
+            return self.feedthrough_context.run_one_net_at_locations(
+                net,
+                locations_factory(),
+                skipped_pin_names,
+            )
+        if not skipped_pin_names:
+            return self.feedthrough_context.run_one_net_at_locations_cached(
+                net,
+                cache_key,
+                locations_factory,
+            )
         return self.feedthrough_context.run_one_net_at_locations_cached(
             net,
             cache_key,
             locations_factory,
+            skipped_pin_names,
         )
 
     def _normalized_improvement(self, reference: float, candidate: float) -> float:
@@ -265,6 +323,9 @@ class RewardEvaluator:
             if pin_name in net_pin_names:
                 locations[pin_name] = point
         return locations
+
+    def _active_pin_count(self, net: Net) -> int:
+        return sum(1 for pin in net.pins if pin.full_name not in self.skipped_pin_names)
 
     @staticmethod
     def _rounded_point(point: Point) -> Point:

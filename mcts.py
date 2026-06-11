@@ -16,6 +16,7 @@ from segment import AbstractSegment, SegmentManager, SegmentUsage
 
 
 Action = Tuple[str, str]
+SKIP_SEGMENT_ID = "__SKIP_UNCOVERED_GROUP__"
 
 
 @dataclass
@@ -116,12 +117,20 @@ class MCTSSolver:
         reward_scale: float = 1.0,
         enable_feedthrough: bool = True,
         feedthrough_context: FeedthroughContext | None = None,
+        skipped_group_names: Iterable[str] | None = None,
     ):
         """初始化 MCTS 搜索所需的数据、参数和随机数种子。"""
         self.placedb = placedb
         self.segment_manager = segment_manager
         self.groups = groups
         self.nets = list(nets)
+        self.skipped_group_names = set(skipped_group_names or [])
+        self.skipped_pin_names = {
+            pin.full_name
+            for group in self.groups
+            if group.name in self.skipped_group_names
+            for pin in group.pins
+        }
         self.simulations = simulations
         self.exploration_constant = exploration_constant
         self.random = random.Random(random_seed)
@@ -181,11 +190,21 @@ class MCTSSolver:
             normalization_floor=reward_normalization_floor,
             reward_scale=reward_scale,
             feedthrough_context=feedthrough_context,
+            skipped_pin_names=self.skipped_pin_names,
         )
 
     def search(self) -> Dict[str, str]:
         """执行已配置的 MCTS 搜索策略。"""
         try:
+            if self.groups and not any(
+                not group.assigned and not self._is_skipped_group(group)
+                for group in self.groups
+            ):
+                return {
+                    group.name: SKIP_SEGMENT_ID
+                    for group in self.groups
+                    if self._is_skipped_group(group)
+                }
             if self.search_mode == "basic":
                 return self._search_basic()
             if self.search_mode == "layered":
@@ -256,7 +275,7 @@ class MCTSSolver:
         profile = self._search_profile(root.usage)
         self.last_search_profile = profile
         self._active_basic_depth = profile.depth
-        if profile.depth == 1:
+        if profile.depth == 1 and not self.skipped_group_names:
             return self._search_depth1_greedy(root)
 
         for _ in range(self._basic_simulation_budget(root.usage, profile)):
@@ -411,7 +430,7 @@ class MCTSSolver:
         branch_counts = [
             len(self._raw_feasible_segments(group, usage))
             for group in self.groups
-            if not group.assigned
+            if not group.assigned and not self._is_skipped_group(group)
         ]
         log_total_space = 0.0
         for count in branch_counts:
@@ -566,7 +585,11 @@ class MCTSSolver:
 
     def _total_search_space_factor(self, usage: SegmentUsage) -> float:
         """Estimate the total combinational search space as a capped scale factor."""
-        active_groups = [group for group in self.groups if not group.assigned]
+        active_groups = [
+            group
+            for group in self.groups
+            if not group.assigned and not self._is_skipped_group(group)
+        ]
         if not active_groups:
             return 0.0
         if self.basic_space_scale_divisor <= 0:
@@ -597,7 +620,11 @@ class MCTSSolver:
 
     def _search_space_factor(self, usage: SegmentUsage) -> float:
         """估算搜索空间放大系数。"""
-        active_groups = [group for group in self.groups if not group.assigned]
+        active_groups = [
+            group
+            for group in self.groups
+            if not group.assigned and not self._is_skipped_group(group)
+        ]
         if not active_groups or self.space_scale_divisor <= 0:
             return 0.0
         branch_counts = []
@@ -637,10 +664,10 @@ class MCTSSolver:
         """按给定 action 创建一个子节点。"""
         group_name, segment_id = action
         group = self.groups[node.group_index]
-        segment = self.segment_manager.abstract_segments[segment_id]
-
         usage = node.usage.clone()
-        usage.assign(segment, group.max_pin_width)
+        if segment_id != SKIP_SEGMENT_ID:
+            segment = self.segment_manager.abstract_segments[segment_id]
+            usage.assign(segment, group.max_pin_width)
         assignments = dict(node.assignments)
         assignments[group_name] = segment_id
 
@@ -721,6 +748,8 @@ class MCTSSolver:
     ) -> List[Action]:
         """Return capacity-feasible actions, optionally candidate-pruned."""
         group = self.groups[node.group_index]
+        if self._is_skipped_group(group):
+            return [(group.name, SKIP_SEGMENT_ID)]
         segments = self._candidate_segments(group, node.usage, tail_profile=tail_profile)
         return [(group.name, segment.segment_id) for segment in segments]
 
@@ -795,7 +824,7 @@ class MCTSSolver:
         for net in self.nets:
             if not any(pin.full_name in related_pin_names for pin in net.pins):
                 continue
-            score -= net_hpwl(net, self.placedb, temporary_locations)
+            score -= net_hpwl(net, self.placedb, temporary_locations, self.skipped_pin_names)
         score += 1e-6 * segment.remaining_capacity
         self._candidate_score_cache[key] = score
         return score
@@ -806,6 +835,9 @@ class MCTSSolver:
         assignments = dict(node.assignments)
         for index in range(node.group_index, len(self.groups)):
             group = self.groups[index]
+            if self._is_skipped_group(group):
+                assignments[group.name] = SKIP_SEGMENT_ID
+                continue
             feasible = self._candidate_segments(group, usage)
             if not feasible:
                 return -1.0e30
@@ -821,7 +853,7 @@ class MCTSSolver:
         locations = {}
         for group in self.groups:
             segment_id = assignments.get(group.name)
-            if segment_id is None:
+            if segment_id is None or segment_id == SKIP_SEGMENT_ID:
                 continue
             for pin in group.pins:
                 try:
@@ -877,6 +909,10 @@ class MCTSSolver:
         for group in self.groups:
             if group.assigned or group.name in assigned_names:
                 continue
+            if self._is_skipped_group(group):
+                completed[group.name] = SKIP_SEGMENT_ID
+                assigned_names.add(group.name)
+                continue
             feasible = self._candidate_segments(group, local_usage)
             if not feasible:
                 continue
@@ -927,6 +963,10 @@ class MCTSSolver:
         for group in self.groups:
             if group.assigned or group.name in assigned_names:
                 continue
+            if self._is_skipped_group(group):
+                completed[group.name] = SKIP_SEGMENT_ID
+                assigned_names.add(group.name)
+                continue
             feasible = self._candidate_segments(group, local_usage, tail_profile=True)
             if not feasible:
                 continue
@@ -945,6 +985,10 @@ class MCTSSolver:
     def _greedy_assignment(self, usage: SegmentUsage) -> Dict[str, str]:
         """在没有可用 MCTS 子节点时，直接生成贪心分配方案。"""
         return self._complete_greedily({}, usage)
+
+    def _is_skipped_group(self, group: PinHomologyGroup) -> bool:
+        """Return whether this group is a true skip action in the current local tree."""
+        return group.name in self.skipped_group_names
 
 
 def get_simulation_budget(group_count: int, base: int = 128) -> int:

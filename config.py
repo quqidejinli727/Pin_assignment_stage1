@@ -145,6 +145,10 @@ class RunConfig:
     # ===== 同构组提交设置 =====
     # 是否在同构组排序时把多扇出 Pin 按 successors 连接数视为更高复用次数；关闭时只按唯一物理 Pin 数排序。
     homology_use_fanout_reuse_for_sorting: bool = True
+    # 是否在 MCTS reward 中真正跳过未达到覆盖阈值的同构组；关闭时保持旧行为，仍为这些组搜索临时位置。
+    homology_skip_uncovered_groups: bool = False
+    # 真正跳过模式使用的独立覆盖阈值；0 表示不跳过任何同构组，和旧的提交覆盖阈值互不影响。
+    homology_skip_coverage_threshold: float = 1.0
     # 当前 pins_in 覆盖同构组 Pin 比例达到该阈值时，允许直接提交整组到同一 segment；1 表示仅完整覆盖才提交。
     homology_group_commit_coverage_threshold: float = 1.0
     # 可提交同构组数占当前 MCTS 搜索同构组数比例不超过该值时，跳过当前 MCTS 树。

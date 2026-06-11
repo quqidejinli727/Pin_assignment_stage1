@@ -8,7 +8,7 @@ from typing import Dict, List, Set
 
 from PlaceDB import Net, Pin, PlaceDB
 from homology import HomologyManager, PinHomologyGroup
-from mcts import MCTSSolver, get_simulation_budget
+from mcts import MCTSSolver, SKIP_SEGMENT_ID, get_simulation_budget
 from scoring import FeedthroughContext, RewardEvaluator, final_net_metrics
 from segment import SegmentManager
 from segment_subdivision import percentile_edge_length
@@ -65,6 +65,8 @@ class AssignmentSolver:
         mcts_hybrid_ultradeep_min_layer_simulations: int = 32,
         mcts_hybrid_ultradeep_max_layer_simulations: int = 128,
         mcts_hybrid_use_fast_completion_for_ultradeep: bool = True,
+        homology_skip_uncovered_groups: bool = False,
+        homology_skip_coverage_threshold: float = 1.0,
         homology_group_commit_coverage_threshold: float = 1.0,
         mcts_tree_min_committable_group_ratio: float = 0.3,
         mcts_enable_candidate_pruning: bool = True,
@@ -122,6 +124,8 @@ class AssignmentSolver:
         self.auto_build_feedthrough = auto_build_feedthrough
         self.cmake_generator = cmake_generator
         self.feedthrough_context: FeedthroughContext | None = None
+        self.homology_skip_uncovered_groups = homology_skip_uncovered_groups
+        self.homology_skip_coverage_threshold = homology_skip_coverage_threshold
         self.homology_group_commit_coverage_threshold = homology_group_commit_coverage_threshold
         self.mcts_tree_min_committable_group_ratio = mcts_tree_min_committable_group_ratio
         self.skipped_mcts_trees: List[Dict[str, object]] = []
@@ -210,6 +214,13 @@ class AssignmentSolver:
 
             pin_full_names = {pin.full_name for pin in pins_in}
             committable_groups = self._committable_groups(related_groups, pin_full_names)
+            skipped_group_names = self._uncovered_group_names(
+                related_groups,
+                pin_full_names,
+                self.homology_skip_coverage_threshold,
+            )
+            if not self.homology_skip_uncovered_groups:
+                skipped_group_names = set()
             committable_group_ratio = self._group_ratio(
                 len(committable_groups),
                 len(related_groups),
@@ -236,6 +247,7 @@ class AssignmentSolver:
                 simulations=budget,
                 random_seed=self.random_seed + self.assignment_rounds,
                 feedthrough_context=self.feedthrough_context,
+                skipped_group_names=skipped_group_names,
                 **self.mcts_options,
             )
             proposed_assignment = mcts.search()
@@ -331,6 +343,8 @@ class AssignmentSolver:
                 if self._assign_group_greedily(group, "missing_mcts_assignment"):
                     committed_count += 1
                 continue
+            if segment_id == SKIP_SEGMENT_ID:
+                continue
             invalid_reason = self._validate_segment_assignment(group, segment_id)
             if invalid_reason is not None:
                 if self._assign_group_greedily(group, invalid_reason):
@@ -356,6 +370,24 @@ class AssignmentSolver:
             if coverage_ratio >= threshold:
                 committable.append(group)
         return committable
+
+    def _uncovered_group_names(
+        self,
+        related_groups: List[PinHomologyGroup],
+        pin_full_names: Set[str],
+        coverage_threshold: float,
+    ) -> Set[str]:
+        """Return groups below the true-skip coverage threshold."""
+        threshold = max(0.0, min(1.0, coverage_threshold))
+        skipped = set()
+        for group in related_groups:
+            if not group.pins:
+                continue
+            covered_count = sum(1 for pin in group.pins if pin.full_name in pin_full_names)
+            coverage_ratio = covered_count / len(group.pins)
+            if coverage_ratio < threshold:
+                skipped.add(group.name)
+        return skipped
 
     def _record_skipped_mcts_tree(
         self,

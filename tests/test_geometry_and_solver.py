@@ -7,8 +7,8 @@ from analyze_mcts_tree_batches import analyze_batches
 from assignment_solver import AssignmentSolver
 from geometry_utils import align_vertices_to_reference
 from homology import HomologyManager
-from mcts import MCTSNode, MCTSSolver
-from scoring import RewardEvaluator, final_net_metrics, summarize_metrics
+from mcts import MCTSNode, MCTSSolver, SKIP_SEGMENT_ID
+from scoring import RewardEvaluator, final_net_metrics, net_hpwl, summarize_metrics
 from segment import SegmentManager
 from PlaceDB import PlaceDB
 
@@ -253,6 +253,98 @@ def test_fanout_reuse_sorting_can_be_disabled(tmp_path):
     assert ordinary_homology.pin_groups["A.fan"].sort_reuse_count == 1
     assert fanout_homology.unassigned_groups()[0].name == "A.fan"
     assert ordinary_homology.unassigned_groups()[0].name == "B.p"
+
+
+def test_reward_true_skip_removes_pin_from_hpwl(tmp_path):
+    """Skipped pins are removed from reward metrics instead of using virtual locations."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    net = placedb.nets_list[0]
+    skipped = {"TOP.U_B0.q"}
+
+    assigned_b_location = {"TOP.U_B0.q": (1000.0, 1000.0)}
+    assert net_hpwl(net, placedb, assigned_b_location) > 0.0
+    assert net_hpwl(net, placedb, assigned_b_location, skipped) == 0.0
+
+    evaluator = RewardEvaluator(
+        [net],
+        placedb,
+        wirelength_weight=1.0,
+        feedthrough_weight=0.0,
+        skipped_pin_names=skipped,
+    )
+    try:
+        assert evaluator.metric_nets == []
+        assert evaluator.evaluate(assigned_b_location) == 0.0
+    finally:
+        evaluator.close()
+
+
+def test_mcts_skip_groups_do_not_inflate_search_profile(tmp_path):
+    """Skip-only groups should not count as effective MCTS depth or emit locations."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    groups = homology.unassigned_groups()
+    skipped_names = {groups[0].name}
+
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=4,
+        search_mode="basic",
+        feedthrough_weight=0.0,
+        skipped_group_names=skipped_names,
+    )
+    profile = mcts._search_profile(segments.snapshot_usage())
+    assert profile.depth == len(groups) - 1
+
+    assignments = {groups[0].name: "__SKIP_UNCOVERED_GROUP__"}
+    locations = mcts._temporary_locations(assignments)
+    assert all(pin.full_name not in locations for pin in groups[0].pins)
+
+
+def test_skip_assignment_is_not_committed_or_greedy_fallback(tmp_path):
+    """A true-skip MCTS action should not be converted into a real segment assignment."""
+    block_path, pingroup_path = write_case(tmp_path)
+    solver = AssignmentSolver(str(block_path), str(pingroup_path), simulations=2)
+    group = solver.homology.unassigned_groups()[0]
+    fallback_calls = []
+
+    def fake_greedy(unused_group, unused_reason):
+        fallback_calls.append((unused_group.name, unused_reason))
+        return True
+
+    solver._assign_group_greedily = fake_greedy
+    committed = solver._commit_contained_groups(
+        [group],
+        list(group.pins),
+        {group.name: SKIP_SEGMENT_ID},
+    )
+
+    assert committed == 0
+    assert fallback_calls == []
+    assert not group.assigned
+    assert all(pin.assigned_segment_id is None for pin in group.pins)
+
+
+def test_zero_coverage_threshold_disables_uncovered_group_skip(tmp_path):
+    """Coverage threshold 0 keeps every group placeable even when skip mode is enabled."""
+    block_path, pingroup_path = write_low_committable_case(tmp_path)
+    solver = AssignmentSolver(
+        str(block_path),
+        str(pingroup_path),
+        simulations=2,
+        enable_segment_subdivision=False,
+        homology_skip_uncovered_groups=True,
+        homology_skip_coverage_threshold=0.0,
+        homology_group_commit_coverage_threshold=1.0,
+    )
+    groups = solver.homology.unassigned_groups()
+    assert solver._uncovered_group_names(groups, set(), solver.homology_skip_coverage_threshold) == set()
 
 
 def test_solver_assigns_all_pins_and_respects_capacity(tmp_path):
