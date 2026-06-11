@@ -101,137 +101,147 @@ def analyze_batches(
     tree_index = 0
     candidate_tree_index = 0
 
-    for seed_group in homology.unassigned_groups():
-        if seed_group.assigned:
-            continue
+    while True:
+        made_progress = False
+        for seed_group in homology.unassigned_groups():
+            if seed_group.assigned:
+                continue
 
-        nets = homology.get_related_nets(seed_group)
-        if not nets:
-            homology.mark_assigned(seed_group, "simulated_no_related_net")
-            non_mcts_assignments.append(
-                {
-                    "reason": "no_related_net",
-                    "group": seed_group.name,
-                    "pin_count": len(seed_group.pins),
-                }
-            )
-            continue
+            nets = homology.get_related_nets(seed_group)
+            if not nets:
+                homology.mark_assigned(seed_group, "simulated_no_related_net")
+                non_mcts_assignments.append(
+                    {
+                        "reason": "no_related_net",
+                        "group": seed_group.name,
+                        "pin_count": len(seed_group.pins),
+                    }
+                )
+                made_progress = True
+                continue
 
-        pins_in = _collect_pins(nets)
-        related_groups = [
-            group
-            for group in homology.groups_for_pins(pins_in)
-            if not group.assigned
-        ]
-        if not related_groups:
-            homology.mark_assigned(seed_group, "simulated_no_related_unassigned_group")
-            non_mcts_assignments.append(
-                {
-                    "reason": "no_related_unassigned_group",
-                    "group": seed_group.name,
-                    "pin_count": len(seed_group.pins),
-                }
-            )
-            continue
+            pins_in = _collect_pins(nets)
+            related_groups = [
+                group
+                for group in homology.groups_for_pins(pins_in)
+                if not group.assigned
+            ]
+            if not related_groups:
+                homology.mark_assigned(seed_group, "simulated_no_related_unassigned_group")
+                non_mcts_assignments.append(
+                    {
+                        "reason": "no_related_unassigned_group",
+                        "group": seed_group.name,
+                        "pin_count": len(seed_group.pins),
+                    }
+                )
+                made_progress = True
+                continue
 
-        pin_full_names = {pin.full_name for pin in pins_in}
-        committable_groups = _committable_groups(
-            related_groups,
-            pin_full_names,
-            coverage_threshold,
-        )
-        skipped_group_names = (
-            _uncovered_group_names(
+            pin_full_names = {pin.full_name for pin in pins_in}
+            committable_groups = _committable_groups(
                 related_groups,
                 pin_full_names,
-                skip_coverage_threshold,
+                coverage_threshold,
             )
-            if skip_uncovered_groups
-            else set()
-        )
-        effective_search_groups = [
-            group for group in related_groups if group.name not in skipped_group_names
-        ]
-        effective_committable_groups = [
-            group for group in committable_groups if group.name not in skipped_group_names
-        ]
-        committable_group_names = {group.name for group in committable_groups}
-        deferred_groups = [
-            group for group in related_groups if group.name not in committable_group_names
-        ]
-        skipped_groups = [
-            group for group in related_groups if group.name in skipped_group_names
-        ]
+            skipped_group_names = (
+                _uncovered_group_names(
+                    related_groups,
+                    pin_full_names,
+                    skip_coverage_threshold,
+                )
+                if skip_uncovered_groups
+                else set()
+            )
+            effective_search_groups = [
+                group for group in related_groups if group.name not in skipped_group_names
+            ]
+            effective_committable_groups = [
+                group for group in committable_groups if group.name not in skipped_group_names
+            ]
+            committable_group_names = {group.name for group in committable_groups}
+            deferred_groups = [
+                group for group in related_groups if group.name not in committable_group_names
+            ]
+            skipped_groups = [
+                group for group in related_groups if group.name in skipped_group_names
+            ]
 
-        raw_search_group_count = len(related_groups)
-        raw_search_pin_count = _group_pin_count(related_groups)
-        search_group_count = len(effective_search_groups)
-        search_pin_count = _group_pin_count(effective_search_groups)
-        raw_committable_pin_count = _group_pin_count(committable_groups)
-        committable_pin_count = _group_pin_count(effective_committable_groups)
-        committable_group_ratio = _ratio(len(committable_groups), raw_search_group_count)
-        effective_committable_group_ratio = _ratio(
-            len(effective_committable_groups),
-            search_group_count,
-        )
-        pins_in_count = len(pin_full_names)
+            raw_search_group_count = len(related_groups)
+            raw_search_pin_count = _group_pin_count(related_groups)
+            search_group_count = len(effective_search_groups)
+            search_pin_count = _group_pin_count(effective_search_groups)
+            raw_committable_pin_count = _group_pin_count(committable_groups)
+            committable_pin_count = _group_pin_count(effective_committable_groups)
+            committable_group_ratio = _ratio(len(committable_groups), raw_search_group_count)
+            effective_committable_group_ratio = _ratio(
+                len(effective_committable_groups),
+                search_group_count,
+            )
+            pins_in_count = len(pin_full_names)
 
-        report = {
-            "candidate_tree_index": candidate_tree_index,
-            "tree_index": tree_index,
-            "seed_group": seed_group.name,
-            "related_net_count": len(nets),
-            "related_net_ids": [net.net_id for net in nets],
-            "pins_in_count": pins_in_count,
-            "mcts_depth": search_group_count,
-            "raw_mcts_depth": raw_search_group_count,
-            "search_group_count": search_group_count,
-            "search_pin_count": search_pin_count,
-            "raw_search_group_count": raw_search_group_count,
-            "raw_search_pin_count": raw_search_pin_count,
-            "true_skipped_group_count": len(skipped_groups),
-            "true_skipped_pin_count": _group_pin_count(skipped_groups),
-            "committable_group_count": len(effective_committable_groups),
-            "committable_pin_count": committable_pin_count,
-            "raw_committable_group_count": len(committable_groups),
-            "raw_committable_pin_count": raw_committable_pin_count,
-            "committable_group_ratio_of_search_groups": committable_group_ratio,
-            "effective_committable_group_ratio_of_search_groups": (
-                effective_committable_group_ratio
-            ),
-            "committable_pin_ratio_of_search_pins": _ratio(
-                committable_pin_count,
-                search_pin_count,
-            ),
-            "committable_pin_ratio_of_pins_in": _ratio(
-                committable_pin_count,
-                pins_in_count,
-            ),
-            "deferred_group_count": len(deferred_groups),
-            "deferred_pin_count": _group_pin_count(deferred_groups),
-            "skipped_by_low_committable_ratio": (
-                committable_group_ratio <= min_committable_group_ratio
-            ),
-            "search_groups": _group_records(effective_search_groups),
-            "raw_search_groups": _group_records(related_groups),
-            "committable_groups": _group_records(effective_committable_groups),
-            "raw_committable_groups": _group_records(committable_groups),
-            "deferred_groups": _group_records(deferred_groups),
-            "true_skipped_groups": _group_records(skipped_groups),
-        }
+            report = {
+                "candidate_tree_index": candidate_tree_index,
+                "tree_index": tree_index,
+                "seed_group": seed_group.name,
+                "related_net_count": len(nets),
+                "related_net_ids": [net.net_id for net in nets],
+                "pins_in_count": pins_in_count,
+                "mcts_depth": search_group_count,
+                "raw_mcts_depth": raw_search_group_count,
+                "search_group_count": search_group_count,
+                "search_pin_count": search_pin_count,
+                "raw_search_group_count": raw_search_group_count,
+                "raw_search_pin_count": raw_search_pin_count,
+                "true_skipped_group_count": len(skipped_groups),
+                "true_skipped_pin_count": _group_pin_count(skipped_groups),
+                "committable_group_count": len(effective_committable_groups),
+                "committable_pin_count": committable_pin_count,
+                "raw_committable_group_count": len(committable_groups),
+                "raw_committable_pin_count": raw_committable_pin_count,
+                "committable_group_ratio_of_search_groups": committable_group_ratio,
+                "effective_committable_group_ratio_of_search_groups": (
+                    effective_committable_group_ratio
+                ),
+                "committable_pin_ratio_of_search_pins": _ratio(
+                    committable_pin_count,
+                    search_pin_count,
+                ),
+                "committable_pin_ratio_of_pins_in": _ratio(
+                    committable_pin_count,
+                    pins_in_count,
+                ),
+                "deferred_group_count": len(deferred_groups),
+                "deferred_pin_count": _group_pin_count(deferred_groups),
+                "skipped_by_low_committable_ratio": (
+                    committable_group_ratio <= min_committable_group_ratio
+                ),
+                "search_groups": _group_records(effective_search_groups),
+                "raw_search_groups": _group_records(related_groups),
+                "committable_groups": _group_records(effective_committable_groups),
+                "raw_committable_groups": _group_records(committable_groups),
+                "deferred_groups": _group_records(deferred_groups),
+                "true_skipped_groups": _group_records(skipped_groups),
+            }
 
-        if report["skipped_by_low_committable_ratio"]:
-            report["tree_index"] = None
-            skipped_tree_reports.append(report)
+            if report["skipped_by_low_committable_ratio"]:
+                report["tree_index"] = None
+                skipped_tree_reports.append(report)
+                candidate_tree_index += 1
+                continue
+
+            tree_reports.append(report)
+            current_tree_index = tree_index
+            tree_index += 1
             candidate_tree_index += 1
-            continue
 
-        tree_reports.append(report)
-        tree_index += 1
-        candidate_tree_index += 1
+            for group in effective_committable_groups:
+                homology.mark_assigned(group, f"simulated_tree_{current_tree_index}")
+            if effective_committable_groups:
+                made_progress = True
 
-        for group in effective_committable_groups:
-            homology.mark_assigned(group, f"simulated_tree_{tree_index - 1}")
+        if not homology.unassigned_groups() or not made_progress:
+            break
 
     final_greedy_groups = homology.unassigned_groups()
     for group in final_greedy_groups:

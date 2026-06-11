@@ -194,65 +194,81 @@ class AssignmentSolver:
 
     def _solve_with_open_context(self) -> Dict[str, object]:
         """Run assignment while keeping the optional feedthrough context open."""
-        for seed_group in self.homology.unassigned_groups():
-            if seed_group.assigned:
-                continue
-            nets = self.homology.get_related_nets(seed_group)
-            if not nets:
-                self._assign_group_greedily(seed_group, "no_related_net")
-                continue
+        while True:
+            made_progress = False
+            for seed_group in self.homology.unassigned_groups():
+                if seed_group.assigned:
+                    continue
+                nets = self.homology.get_related_nets(seed_group)
+                if not nets:
+                    made_progress = self._assign_group_greedily(
+                        seed_group,
+                        "no_related_net",
+                    ) or made_progress
+                    continue
 
-            pins_in = self._collect_pins(nets)
-            related_groups = [
-                group
-                for group in self.homology.groups_for_pins(pins_in)
-                if not group.assigned
-            ]
-            if not related_groups:
-                self._assign_group_greedily(seed_group, "no_related_unassigned_group")
-                continue
+                pins_in = self._collect_pins(nets)
+                related_groups = [
+                    group
+                    for group in self.homology.groups_for_pins(pins_in)
+                    if not group.assigned
+                ]
+                if not related_groups:
+                    made_progress = self._assign_group_greedily(
+                        seed_group,
+                        "no_related_unassigned_group",
+                    ) or made_progress
+                    continue
 
-            pin_full_names = {pin.full_name for pin in pins_in}
-            committable_groups = self._committable_groups(related_groups, pin_full_names)
-            skipped_group_names = self._uncovered_group_names(
-                related_groups,
-                pin_full_names,
-                self.homology_skip_coverage_threshold,
-            )
-            if not self.homology_skip_uncovered_groups:
-                skipped_group_names = set()
-            committable_group_ratio = self._group_ratio(
-                len(committable_groups),
-                len(related_groups),
-            )
-            if committable_group_ratio <= self.mcts_tree_min_committable_group_ratio:
-                self._record_skipped_mcts_tree(
-                    seed_group,
+                pin_full_names = {pin.full_name for pin in pins_in}
+                committable_groups = self._committable_groups(related_groups, pin_full_names)
+                skipped_group_names = self._uncovered_group_names(
                     related_groups,
-                    committable_groups,
-                    committable_group_ratio,
+                    pin_full_names,
+                    self.homology_skip_coverage_threshold,
                 )
-                continue
+                if not self.homology_skip_uncovered_groups:
+                    skipped_group_names = set()
+                committable_group_ratio = self._group_ratio(
+                    len(committable_groups),
+                    len(related_groups),
+                )
+                if committable_group_ratio <= self.mcts_tree_min_committable_group_ratio:
+                    self._record_skipped_mcts_tree(
+                        seed_group,
+                        related_groups,
+                        committable_groups,
+                        committable_group_ratio,
+                    )
+                    continue
 
-            budget = (
-                self.simulations
-                if self.simulations is not None
-                else get_simulation_budget(len(related_groups))
-            )
-            mcts = MCTSSolver(
-                placedb=self.placedb,
-                segment_manager=self.segment_manager,
-                groups=related_groups,
-                nets=nets,
-                simulations=budget,
-                random_seed=self.random_seed + self.assignment_rounds,
-                feedthrough_context=self.feedthrough_context,
-                skipped_group_names=skipped_group_names,
-                **self.mcts_options,
-            )
-            proposed_assignment = mcts.search()
-            self._commit_contained_groups(related_groups, pins_in, proposed_assignment)
-            self.assignment_rounds += 1
+                budget = (
+                    self.simulations
+                    if self.simulations is not None
+                    else get_simulation_budget(len(related_groups))
+                )
+                mcts = MCTSSolver(
+                    placedb=self.placedb,
+                    segment_manager=self.segment_manager,
+                    groups=related_groups,
+                    nets=nets,
+                    simulations=budget,
+                    random_seed=self.random_seed + self.assignment_rounds,
+                    feedthrough_context=self.feedthrough_context,
+                    skipped_group_names=skipped_group_names,
+                    **self.mcts_options,
+                )
+                proposed_assignment = mcts.search()
+                committed_count = self._commit_contained_groups(
+                    related_groups,
+                    pins_in,
+                    proposed_assignment,
+                )
+                made_progress = committed_count > 0 or made_progress
+                self.assignment_rounds += 1
+
+            if not self.homology.unassigned_groups() or not made_progress:
+                break
 
         self._finalize_unassigned_groups()
         return self.build_output()
