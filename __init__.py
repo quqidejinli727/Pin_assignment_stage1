@@ -45,6 +45,7 @@ def run_mcts(
     output_dir: str,
     num_simulations: int = 1000,
     time_limit: float | None = None,
+    config_overrides: dict | None = None,
 ) -> str:
     """Run MCTS segment assignment.
 
@@ -55,6 +56,8 @@ def run_mcts(
         num_simulations: MCTS base simulation count.
         time_limit: Accepted for run.py compatibility; the current solver uses
             simulation count rather than a wall-clock limit.
+        config_overrides: Optional Stage 1 RunConfig field overrides supplied
+            by the top-level run.py command line.
 
     Returns:
         Path to the generated ``segment_assignments_*.json`` file.
@@ -73,14 +76,20 @@ def run_mcts(
             time_limit,
         )
 
+    overrides = dict(config_overrides or {})
+    overrides.setdefault("simulations", num_simulations)
+
     config = replace(
         DEFAULT_CONFIG,
+        **overrides,
+    )
+    config = replace(
+        config,
         block_json_path=Path(block_json).resolve(),
         pingroup_json_path=Path(pingroup_json).resolve(),
         assignment_output_path=output_path / "stage1_assignment.json",
         results_root=output_path / "stage1_run_results",
         interface_result_dir=output_path,
-        simulations=num_simulations,
     )
     solver = AssignmentSolver(
         block_json_path=str(config.block_json_path),
