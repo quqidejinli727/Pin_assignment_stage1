@@ -626,6 +626,31 @@ def test_batch_analysis_uses_coverage_and_skip_thresholds(tmp_path):
     )
 
 
+def test_batch_analysis_true_skip_uses_effective_mcts_depth(tmp_path):
+    """True-skip groups should be raw candidates but not effective MCTS depth."""
+    block_path, pingroup_path = write_low_committable_case(tmp_path)
+
+    report = analyze_batches(
+        block_path,
+        pingroup_path,
+        coverage_threshold=0.0,
+        min_committable_group_ratio=0.3,
+        skip_uncovered_groups=True,
+        skip_coverage_threshold=1.0,
+    )
+
+    first_tree = report["tree_reports"][0]
+    assert first_tree["raw_mcts_depth"] == 4
+    assert first_tree["mcts_depth"] == 1
+    assert first_tree["raw_committable_group_count"] == 4
+    assert first_tree["committable_group_count"] == 1
+    assert first_tree["true_skipped_group_count"] == 3
+    assert first_tree["raw_search_pin_count"] == 8
+    assert first_tree["search_pin_count"] == 2
+    assert report["summary"]["true_skipped_group_visits"] == 6
+    assert report["summary"]["total_mcts_search_group_visits"] == 4
+
+
 def test_basic_mcts_dynamic_budget_scales_with_total_search_space(tmp_path):
     """Verify Basic mode scales N_base by the capped total search-space factor."""
     block_path, pingroup_path = write_case(tmp_path)

@@ -64,12 +64,30 @@ def _committable_groups(
     return committable
 
 
+def _uncovered_group_names(
+    groups: Iterable[PinHomologyGroup],
+    pin_full_names: set[str],
+    coverage_threshold: float,
+) -> set[str]:
+    threshold = max(0.0, min(1.0, coverage_threshold))
+    skipped = set()
+    for group in groups:
+        if not group.pins:
+            continue
+        covered_count = sum(1 for pin in group.pins if pin.full_name in pin_full_names)
+        if _ratio(covered_count, len(group.pins)) < threshold:
+            skipped.add(group.name)
+    return skipped
+
+
 def analyze_batches(
     block_json: str | Path,
     pingroup_json: str | Path,
     coverage_threshold: float = DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
     min_committable_group_ratio: float = DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
     use_fanout_reuse_for_sorting: bool = DEFAULT_CONFIG.homology_use_fanout_reuse_for_sorting,
+    skip_uncovered_groups: bool = DEFAULT_CONFIG.homology_skip_uncovered_groups,
+    skip_coverage_threshold: float = DEFAULT_CONFIG.homology_skip_coverage_threshold,
 ) -> dict:
     placedb = PlaceDB(str(block_json), str(pingroup_json))
     homology = HomologyManager(
@@ -122,15 +140,40 @@ def analyze_batches(
             pin_full_names,
             coverage_threshold,
         )
+        skipped_group_names = (
+            _uncovered_group_names(
+                related_groups,
+                pin_full_names,
+                skip_coverage_threshold,
+            )
+            if skip_uncovered_groups
+            else set()
+        )
+        effective_search_groups = [
+            group for group in related_groups if group.name not in skipped_group_names
+        ]
+        effective_committable_groups = [
+            group for group in committable_groups if group.name not in skipped_group_names
+        ]
         committable_group_names = {group.name for group in committable_groups}
         deferred_groups = [
             group for group in related_groups if group.name not in committable_group_names
         ]
+        skipped_groups = [
+            group for group in related_groups if group.name in skipped_group_names
+        ]
 
-        search_group_count = len(related_groups)
-        search_pin_count = _group_pin_count(related_groups)
-        committable_pin_count = _group_pin_count(committable_groups)
-        committable_group_ratio = _ratio(len(committable_groups), search_group_count)
+        raw_search_group_count = len(related_groups)
+        raw_search_pin_count = _group_pin_count(related_groups)
+        search_group_count = len(effective_search_groups)
+        search_pin_count = _group_pin_count(effective_search_groups)
+        raw_committable_pin_count = _group_pin_count(committable_groups)
+        committable_pin_count = _group_pin_count(effective_committable_groups)
+        committable_group_ratio = _ratio(len(committable_groups), raw_search_group_count)
+        effective_committable_group_ratio = _ratio(
+            len(effective_committable_groups),
+            search_group_count,
+        )
         pins_in_count = len(pin_full_names)
 
         report = {
@@ -141,11 +184,21 @@ def analyze_batches(
             "related_net_ids": [net.net_id for net in nets],
             "pins_in_count": pins_in_count,
             "mcts_depth": search_group_count,
+            "raw_mcts_depth": raw_search_group_count,
             "search_group_count": search_group_count,
             "search_pin_count": search_pin_count,
-            "committable_group_count": len(committable_groups),
+            "raw_search_group_count": raw_search_group_count,
+            "raw_search_pin_count": raw_search_pin_count,
+            "true_skipped_group_count": len(skipped_groups),
+            "true_skipped_pin_count": _group_pin_count(skipped_groups),
+            "committable_group_count": len(effective_committable_groups),
             "committable_pin_count": committable_pin_count,
+            "raw_committable_group_count": len(committable_groups),
+            "raw_committable_pin_count": raw_committable_pin_count,
             "committable_group_ratio_of_search_groups": committable_group_ratio,
+            "effective_committable_group_ratio_of_search_groups": (
+                effective_committable_group_ratio
+            ),
             "committable_pin_ratio_of_search_pins": _ratio(
                 committable_pin_count,
                 search_pin_count,
@@ -159,9 +212,12 @@ def analyze_batches(
             "skipped_by_low_committable_ratio": (
                 committable_group_ratio <= min_committable_group_ratio
             ),
-            "search_groups": _group_records(related_groups),
-            "committable_groups": _group_records(committable_groups),
+            "search_groups": _group_records(effective_search_groups),
+            "raw_search_groups": _group_records(related_groups),
+            "committable_groups": _group_records(effective_committable_groups),
+            "raw_committable_groups": _group_records(committable_groups),
             "deferred_groups": _group_records(deferred_groups),
+            "true_skipped_groups": _group_records(skipped_groups),
         }
 
         if report["skipped_by_low_committable_ratio"]:
@@ -174,7 +230,7 @@ def analyze_batches(
         tree_index += 1
         candidate_tree_index += 1
 
-        for group in committable_groups:
+        for group in effective_committable_groups:
             homology.mark_assigned(group, f"simulated_tree_{tree_index - 1}")
 
     final_greedy_groups = homology.unassigned_groups()
@@ -199,6 +255,8 @@ def analyze_batches(
             "use_fanout_reuse_for_sorting": use_fanout_reuse_for_sorting,
             "coverage_threshold": coverage_threshold,
             "min_committable_group_ratio": min_committable_group_ratio,
+            "skip_uncovered_groups": skip_uncovered_groups,
+            "skip_coverage_threshold": skip_coverage_threshold,
         },
         "summary": {
             "total_homology_group_count": len(homology.pin_groups),
@@ -215,9 +273,21 @@ def analyze_batches(
                 total_committable_pin_count,
                 total_search_pin_count,
             ),
+            "true_skipped_group_visits": sum(
+                report["true_skipped_group_count"] for report in tree_reports
+            ),
+            "true_skipped_pin_visits": sum(
+                report["true_skipped_pin_count"] for report in tree_reports
+            ),
             "skipped_mcts_tree_count": len(skipped_tree_reports),
             "skipped_mcts_search_group_count": skipped_search_group_count,
             "skipped_mcts_search_pin_count": skipped_search_pin_count,
+            "skipped_mcts_raw_search_group_count": sum(
+                report["raw_search_group_count"] for report in skipped_tree_reports
+            ),
+            "skipped_mcts_raw_search_pin_count": sum(
+                report["raw_search_pin_count"] for report in skipped_tree_reports
+            ),
             "final_greedy_group_count": len(final_greedy_groups),
             "final_greedy_pin_count": final_greedy_pin_count,
             "non_mcts_assignment_count": len(non_mcts_assignments),
@@ -285,6 +355,18 @@ def main() -> None:
         default=DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
         help="Skip a candidate MCTS tree when committable/search group ratio is <= this value.",
     )
+    parser.add_argument(
+        "--skip-uncovered-groups",
+        action=argparse.BooleanOptionalAction,
+        default=DEFAULT_CONFIG.homology_skip_uncovered_groups,
+        help="Mirror true-skip mode for homology groups below the skip coverage threshold.",
+    )
+    parser.add_argument(
+        "--skip-coverage-threshold",
+        type=float,
+        default=DEFAULT_CONFIG.homology_skip_coverage_threshold,
+        help="Coverage ratio below which true-skip mode removes a homology group from MCTS depth.",
+    )
     args = parser.parse_args()
 
     report = analyze_batches(
@@ -293,6 +375,8 @@ def main() -> None:
         use_fanout_reuse_for_sorting=args.fanout_reuse_sorting,
         coverage_threshold=args.coverage_threshold,
         min_committable_group_ratio=args.min_committable_group_ratio,
+        skip_uncovered_groups=args.skip_uncovered_groups,
+        skip_coverage_threshold=args.skip_coverage_threshold,
     )
     output_path = Path(args.output) if args.output else default_output_path(Path(args.output_dir))
     output_path.parent.mkdir(parents=True, exist_ok=True)
