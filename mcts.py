@@ -164,6 +164,19 @@ class MCTSSolver:
         self.last_search_profile: SearchProfile | None = None
         self.last_search_diagnostics: Dict[str, object] = {}
         self.last_simulation_count = 0
+        self.timing_profile: Dict[str, float] = {
+            "search_total": 0.0,
+            "select": 0.0,
+            "expand": 0.0,
+            "simulate": 0.0,
+            "simulate_completion": 0.0,
+            "temporary_locations": 0.0,
+            "reward": 0.0,
+            "backpropagate": 0.0,
+            "child_generation": 0.0,
+            "beam_select": 0.0,
+            "best_extract": 0.0,
+        }
         self.reward_evaluator = RewardEvaluator(
             self.nets,
             self.placedb,
@@ -179,6 +192,9 @@ class MCTSSolver:
     def search(self) -> Dict[str, str]:
         """Internal helper."""
         self.last_simulation_count = 0
+        for key in self.timing_profile:
+            self.timing_profile[key] = 0.0
+        started = time.perf_counter()
         try:
             if self.groups and not any(
                 not group.assigned and not self._is_skipped_group(group)
@@ -198,6 +214,7 @@ class MCTSSolver:
                 "Use 'basic' or 'hybrid'."
             )
         finally:
+            self.timing_profile["search_total"] += time.perf_counter() - started
             self.reward_evaluator.close()
 
 
@@ -219,16 +236,27 @@ class MCTSSolver:
             return self._search_depth1_greedy(root)
 
         for _ in range(self._basic_simulation_budget(root.usage, profile)):
+            started = time.perf_counter()
             node = self._select(root)
+            self.timing_profile["select"] += time.perf_counter() - started
             if node.group_index < len(self.groups):
+                started = time.perf_counter()
                 node = self._expand(node)
+                self.timing_profile["expand"] += time.perf_counter() - started
+            started = time.perf_counter()
             reward = self._simulate(node)
+            self.timing_profile["simulate"] += time.perf_counter() - started
+            started = time.perf_counter()
             self._backpropagate(node, reward)
+            self.timing_profile["backpropagate"] += time.perf_counter() - started
 
+        started = time.perf_counter()
         best = self._best_child_by_reward(root)
         if best is None:
             return self._greedy_assignment(root.usage)
-        return self._extract_best_path(best)
+        result = self._extract_best_path(best)
+        self.timing_profile["best_extract"] += time.perf_counter() - started
+        return result
 
     def _search_depth1_greedy(self, root: MCTSNode) -> Dict[str, str]:
         """For a one-layer tree, exhaustively score all candidates with the full reward."""
@@ -298,6 +326,7 @@ class MCTSSolver:
             tail_profile = self._hybrid_uses_tail_profile(profile, depth)
             ultradeep_layer = ultradeep_profile
             children: List[MCTSNode] = []
+            started = time.perf_counter()
             for node in beam:
                 if node.group_index >= len(self.groups):
                     children.append(node)
@@ -307,6 +336,7 @@ class MCTSSolver:
                     continue
                 for action in actions:
                     children.append(self._create_child(node, action))
+            self.timing_profile["child_generation"] += time.perf_counter() - started
 
             if not children:
                 best_partial = max(beam, key=lambda node: len(node.assignments))
@@ -322,14 +352,22 @@ class MCTSSolver:
             for _ in range(layer_budget):
                 if self._hybrid_time_exceeded(start_time):
                     break
+                started = time.perf_counter()
                 child = self._select_layer_child(children)
+                self.timing_profile["select"] += time.perf_counter() - started
+                started = time.perf_counter()
                 reward = self._simulate(child)
+                self.timing_profile["simulate"] += time.perf_counter() - started
+                started = time.perf_counter()
                 self._record_layer_result(child.parent or root, child, reward)
+                self.timing_profile["backpropagate"] += time.perf_counter() - started
                 used_simulations += 1
                 if used_simulations >= total_budget:
                     break
 
+            started = time.perf_counter()
             beam = self._select_hybrid_beam(children, tail_profile, ultradeep_layer)
+            self.timing_profile["beam_select"] += time.perf_counter() - started
             if (
                 self.hybrid_enable_layer_early_stop
                 and self._has_decisive_score_lead(
@@ -339,14 +377,19 @@ class MCTSSolver:
             ):
                 break
 
+        started = time.perf_counter()
         best = self._best_node_from_beam(beam)
         if best is None:
             return self._greedy_assignment(root.usage)
         if len(best.assignments) < len(self.groups):
             if ultradeep_profile and self.hybrid_use_fast_completion_for_ultradeep:
-                return self._complete_fast_by_heuristic(best.assignments, best.usage)
-            return self._complete_greedily(best.assignments, best.usage)
-        return best.assignments
+                result = self._complete_fast_by_heuristic(best.assignments, best.usage)
+            else:
+                result = self._complete_greedily(best.assignments, best.usage)
+        else:
+            result = best.assignments
+        self.timing_profile["best_extract"] += time.perf_counter() - started
+        return result
 
     def _basic_simulation_budget(
         self,
@@ -723,6 +766,7 @@ class MCTSSolver:
     def _simulate(self, node: MCTSNode) -> float:
         """Internal helper."""
         self.last_simulation_count += 1
+        started = time.perf_counter()
         usage = node.usage.clone()
         assignments = dict(node.assignments)
         for index in range(node.group_index, len(self.groups)):
@@ -732,13 +776,20 @@ class MCTSSolver:
                 continue
             feasible = self._candidate_segments(group, usage)
             if not feasible:
+                self.timing_profile["simulate_completion"] += time.perf_counter() - started
                 return -1.0e30
             segment = self.random.choice(feasible)
             usage.assign(segment, group.max_pin_width)
             assignments[group.name] = segment.segment_id
+        self.timing_profile["simulate_completion"] += time.perf_counter() - started
 
+        started = time.perf_counter()
         temporary_locations = self._temporary_locations(assignments)
-        return self.reward_evaluator.evaluate(temporary_locations)
+        self.timing_profile["temporary_locations"] += time.perf_counter() - started
+        started = time.perf_counter()
+        reward = self.reward_evaluator.evaluate(temporary_locations)
+        self.timing_profile["reward"] += time.perf_counter() - started
+        return reward
 
     def _temporary_locations(self, assignments: Dict[str, str]) -> Dict[str, Point]:
         """Internal helper."""

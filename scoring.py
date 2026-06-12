@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import hashlib
 import importlib.util
 from contextlib import redirect_stdout
@@ -163,6 +164,13 @@ class RewardEvaluator:
         self.metric_nets = [net for net in self.nets if self._active_pin_count(net) > 1]
         self.skipped_single_pin_net_count = len(self.nets) - len(self.metric_nets)
         self._pin_estimate_cache: Dict[str, Point] = {}
+        self.timing_profile: Dict[str, float] = {
+            "reward_total": 0.0,
+            "reward_hpwl": 0.0,
+            "reward_feedthrough": 0.0,
+            "reward_feedthrough_location": 0.0,
+            "reward_feedthrough_eval": 0.0,
+        }
         self._net_pins = {id(net): list(net.pins) for net in self.metric_nets}
         self._net_pin_names = {
             id(net): {
@@ -195,20 +203,25 @@ class RewardEvaluator:
 
     def evaluate(self, temporary_locations: Dict[str, Point]) -> float:
         """Return weighted normalized reward for a complete candidate assignment."""
+        started = time.perf_counter()
         total_reward = 0.0
         for net in self.metric_nets:
             reference = self.reference_metrics[id(net)]
+            hpwl_started = time.perf_counter()
             candidate_hpwl = net_hpwl(
                 net,
                 self.placedb,
                 temporary_locations,
                 self.skipped_pin_names,
             )
+            self.timing_profile["reward_hpwl"] += time.perf_counter() - hpwl_started
             wirelength_reward = self._normalized_improvement(reference.hpwl, candidate_hpwl)
 
             feedthrough_reward_value = 0.0
             if self.enable_feedthrough:
+                ft_started = time.perf_counter()
                 candidate_feedthrough = self._candidate_feedthrough(net, temporary_locations)
+                self.timing_profile["reward_feedthrough"] += time.perf_counter() - ft_started
                 feedthrough_reward_value = self._normalized_improvement(
                     reference.feedthrough,
                     candidate_feedthrough,
@@ -218,6 +231,7 @@ class RewardEvaluator:
                 self.wirelength_weight * wirelength_reward
                 + self.feedthrough_weight * feedthrough_reward_value
             )
+        self.timing_profile["reward_total"] += time.perf_counter() - started
         return total_reward * self.reward_scale
 
     def _build_reference_metrics(self, net: Net) -> NetReferenceMetrics:
@@ -281,26 +295,47 @@ class RewardEvaluator:
     ) -> float:
         if self.feedthrough_context is None:
             return 0.0
+        loc_elapsed = 0.0
+
+        def timed_locations_factory():
+            nonlocal loc_elapsed
+            started = time.perf_counter()
+            locations = locations_factory()
+            loc_elapsed += time.perf_counter() - started
+            return locations
+
+        eval_started = time.perf_counter()
         if not hasattr(self.feedthrough_context, "run_one_net_at_locations_cached"):
             if not skipped_pin_names:
-                return self.feedthrough_context.run_one_net_at_locations(net, locations_factory())
-            return self.feedthrough_context.run_one_net_at_locations(
-                net,
-                locations_factory(),
-                skipped_pin_names,
-            )
+                value = self.feedthrough_context.run_one_net_at_locations(
+                    net,
+                    timed_locations_factory(),
+                )
+            else:
+                value = self.feedthrough_context.run_one_net_at_locations(
+                    net,
+                    timed_locations_factory(),
+                    skipped_pin_names,
+                )
+            self.timing_profile["reward_feedthrough_eval"] += time.perf_counter() - eval_started
+            self.timing_profile["reward_feedthrough_location"] += loc_elapsed
+            return value
         if not skipped_pin_names:
-            return self.feedthrough_context.run_one_net_at_locations_cached(
+            value = self.feedthrough_context.run_one_net_at_locations_cached(
                 net,
                 cache_key,
-                locations_factory,
+                timed_locations_factory,
             )
-        return self.feedthrough_context.run_one_net_at_locations_cached(
-            net,
-            cache_key,
-            locations_factory,
-            skipped_pin_names,
-        )
+        else:
+            value = self.feedthrough_context.run_one_net_at_locations_cached(
+                net,
+                cache_key,
+                timed_locations_factory,
+                skipped_pin_names,
+            )
+        self.timing_profile["reward_feedthrough_eval"] += time.perf_counter() - eval_started
+        self.timing_profile["reward_feedthrough_location"] += loc_elapsed
+        return value
 
     def _normalized_improvement(self, reference: float, candidate: float) -> float:
         denominator = max(abs(reference), self.normalization_floor)

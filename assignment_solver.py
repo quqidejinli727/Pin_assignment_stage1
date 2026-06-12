@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Set
@@ -205,6 +206,7 @@ class AssignmentSolver:
 
                 pin_full_names = {pin.full_name for pin in pins_in}
                 committable_groups = self._committable_groups(related_groups, pin_full_names)
+                skip_started = time.perf_counter()
                 skipped_group_names = self._uncovered_group_names(
                     related_groups,
                     pin_full_names,
@@ -212,6 +214,7 @@ class AssignmentSolver:
                 )
                 if not self.homology_skip_uncovered_groups:
                     skipped_group_names = set()
+                skip_elapsed = time.perf_counter() - skip_started
                 budget = (
                     self.simulations
                     if self.simulations is not None
@@ -228,12 +231,27 @@ class AssignmentSolver:
                     skipped_group_names=skipped_group_names,
                     **self.mcts_options,
                 )
+                search_started = time.perf_counter()
                 proposed_assignment = mcts.search()
+                search_elapsed = time.perf_counter() - search_started
                 self.total_mcts_simulations += getattr(mcts, "last_simulation_count", 0)
+                commit_started = time.perf_counter()
                 committed_count = self._commit_contained_groups(
                     related_groups,
                     pins_in,
                     proposed_assignment,
+                )
+                commit_elapsed = time.perf_counter() - commit_started
+                self._print_mcts_timing_log(
+                    seed_group=seed_group,
+                    mcts=mcts,
+                    skip_elapsed=skip_elapsed,
+                    search_elapsed=search_elapsed,
+                    commit_elapsed=commit_elapsed,
+                    related_group_count=len(related_groups),
+                    committable_group_count=len(committable_groups),
+                    skipped_group_count=len(skipped_group_names),
+                    committed_count=committed_count,
                 )
                 made_progress = committed_count > 0 or made_progress
                 self.assignment_rounds += 1
@@ -506,6 +524,52 @@ class AssignmentSolver:
                 f"assigned_pin_count={self.assignment_progress_pin_count}, "
                 f"total_mcts_simulations={self.total_mcts_simulations}"
             )
+
+    def _print_mcts_timing_log(
+        self,
+        seed_group: PinHomologyGroup,
+        mcts: MCTSSolver,
+        skip_elapsed: float,
+        search_elapsed: float,
+        commit_elapsed: float,
+        related_group_count: int,
+        committable_group_count: int,
+        skipped_group_count: int,
+        committed_count: int,
+    ) -> None:
+        profile = getattr(mcts, "timing_profile", {})
+        reward_profile = getattr(getattr(mcts, "reward_evaluator", None), "timing_profile", {})
+
+        def seconds(key: str, source: Dict[str, float]) -> str:
+            return f"{source.get(key, 0.0):.6f}"
+
+        print(
+            "mcts_timing "
+            f"time={datetime.now().isoformat(timespec='seconds')} "
+            f"round={self.assignment_rounds} seed_group={seed_group.name} "
+            f"groups={related_group_count} committable_groups={committable_group_count} "
+            f"true_skipped_groups={skipped_group_count} committed_groups={committed_count} "
+            f"simulations={getattr(mcts, 'last_simulation_count', 0)} "
+            f"search_wall_s={search_elapsed:.6f} "
+            f"search_total_s={seconds('search_total', profile)} "
+            f"select_s={seconds('select', profile)} "
+            f"expand_s={seconds('expand', profile)} "
+            f"child_generation_s={seconds('child_generation', profile)} "
+            f"simulate_s={seconds('simulate', profile)} "
+            f"simulate_completion_s={seconds('simulate_completion', profile)} "
+            f"temporary_locations_s={seconds('temporary_locations', profile)} "
+            f"reward_s={seconds('reward', profile)} "
+            f"reward_total_s={seconds('reward_total', reward_profile)} "
+            f"reward_hpwl_s={seconds('reward_hpwl', reward_profile)} "
+            f"reward_ft_s={seconds('reward_feedthrough', reward_profile)} "
+            f"reward_ft_location_s={seconds('reward_feedthrough_location', reward_profile)} "
+            f"reward_ft_eval_s={seconds('reward_feedthrough_eval', reward_profile)} "
+            f"backpropagate_s={seconds('backpropagate', profile)} "
+            f"beam_select_s={seconds('beam_select', profile)} "
+            f"best_extract_s={seconds('best_extract', profile)} "
+            f"true_skip_check_s={skip_elapsed:.6f} "
+            f"commit_s={commit_elapsed:.6f}"
+        )
 
     def _finalize_unassigned_groups(self) -> None:
         """Sweep all remaining groups with the fallback assignment."""
