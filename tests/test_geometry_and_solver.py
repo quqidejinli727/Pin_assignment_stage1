@@ -1,6 +1,6 @@
 import json
+import logging
 import math
-from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
 
@@ -316,12 +316,20 @@ def test_assignment_progress_log_batches_every_100_groups(tmp_path):
     group = solver.homology.unassigned_groups()[0]
     solver.total_mcts_simulations = 1234
     output = StringIO()
+    handler = logging.StreamHandler(output)
+    logger = logging.getLogger("assignment_solver")
+    old_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
 
-    with redirect_stdout(output):
+    try:
         for _ in range(99):
             solver._print_assignment_progress(group)
         assert output.getvalue() == ""
         solver._print_assignment_progress(group)
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
 
     text = output.getvalue()
     assert "assigned_homology_count=100" in text

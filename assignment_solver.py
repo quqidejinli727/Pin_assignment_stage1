@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from datetime import datetime
 from pathlib import Path
@@ -14,6 +15,9 @@ from mcts import MCTSSolver, SKIP_SEGMENT_ID, get_simulation_budget
 from scoring import FeedthroughContext, RewardEvaluator, final_net_metrics
 from segment import SegmentManager
 from segment_subdivision import percentile_edge_length
+
+
+logger = logging.getLogger(__name__)
 
 
 class AssignmentSolver:
@@ -518,11 +522,13 @@ class AssignmentSolver:
         self.assignment_progress_index += 1
         self.assignment_progress_pin_count += len(group.pins)
         if self.assignment_progress_index % self.assignment_log_interval == 0:
-            print(
-                f"time={datetime.now().isoformat(timespec='seconds')}, "
-                f"assigned_homology_count={self.assignment_progress_index}, "
-                f"assigned_pin_count={self.assignment_progress_pin_count}, "
-                f"total_mcts_simulations={self.total_mcts_simulations}"
+            logger.info(
+                "assignment_progress time=%s assigned_homology_count=%d "
+                "assigned_pin_count=%d total_mcts_simulations=%d",
+                datetime.now().isoformat(timespec="seconds"),
+                self.assignment_progress_index,
+                self.assignment_progress_pin_count,
+                self.total_mcts_simulations,
             )
 
     def _print_mcts_timing_log(
@@ -543,32 +549,42 @@ class AssignmentSolver:
         def seconds(key: str, source: Dict[str, float]) -> str:
             return f"{source.get(key, 0.0):.6f}"
 
-        print(
-            "mcts_timing "
-            f"time={datetime.now().isoformat(timespec='seconds')} "
-            f"round={self.assignment_rounds} seed_group={seed_group.name} "
-            f"groups={related_group_count} committable_groups={committable_group_count} "
-            f"true_skipped_groups={skipped_group_count} committed_groups={committed_count} "
-            f"simulations={getattr(mcts, 'last_simulation_count', 0)} "
-            f"search_wall_s={search_elapsed:.6f} "
-            f"search_total_s={seconds('search_total', profile)} "
-            f"select_s={seconds('select', profile)} "
-            f"expand_s={seconds('expand', profile)} "
-            f"child_generation_s={seconds('child_generation', profile)} "
-            f"simulate_s={seconds('simulate', profile)} "
-            f"simulate_completion_s={seconds('simulate_completion', profile)} "
-            f"temporary_locations_s={seconds('temporary_locations', profile)} "
-            f"reward_s={seconds('reward', profile)} "
-            f"reward_total_s={seconds('reward_total', reward_profile)} "
-            f"reward_hpwl_s={seconds('reward_hpwl', reward_profile)} "
-            f"reward_ft_s={seconds('reward_feedthrough', reward_profile)} "
-            f"reward_ft_location_s={seconds('reward_feedthrough_location', reward_profile)} "
-            f"reward_ft_eval_s={seconds('reward_feedthrough_eval', reward_profile)} "
-            f"backpropagate_s={seconds('backpropagate', profile)} "
-            f"beam_select_s={seconds('beam_select', profile)} "
-            f"best_extract_s={seconds('best_extract', profile)} "
-            f"true_skip_check_s={skip_elapsed:.6f} "
-            f"commit_s={commit_elapsed:.6f}"
+        logger.info(
+            "mcts_timing time=%s round=%d seed_group=%s groups=%d "
+            "committable_groups=%d true_skipped_groups=%d committed_groups=%d "
+            "simulations=%d search_wall_s=%.6f search_total_s=%s select_s=%s "
+            "expand_s=%s child_generation_s=%s simulate_s=%s "
+            "simulate_completion_s=%s temporary_locations_s=%s reward_s=%s "
+            "reward_total_s=%s reward_hpwl_s=%s reward_ft_s=%s "
+            "reward_ft_location_s=%s reward_ft_eval_s=%s backpropagate_s=%s "
+            "beam_select_s=%s best_extract_s=%s true_skip_check_s=%.6f commit_s=%.6f",
+            datetime.now().isoformat(timespec="seconds"),
+            self.assignment_rounds,
+            seed_group.name,
+            related_group_count,
+            committable_group_count,
+            skipped_group_count,
+            committed_count,
+            getattr(mcts, "last_simulation_count", 0),
+            search_elapsed,
+            seconds("search_total", profile),
+            seconds("select", profile),
+            seconds("expand", profile),
+            seconds("child_generation", profile),
+            seconds("simulate", profile),
+            seconds("simulate_completion", profile),
+            seconds("temporary_locations", profile),
+            seconds("reward", profile),
+            seconds("reward_total", reward_profile),
+            seconds("reward_hpwl", reward_profile),
+            seconds("reward_feedthrough", reward_profile),
+            seconds("reward_feedthrough_location", reward_profile),
+            seconds("reward_feedthrough_eval", reward_profile),
+            seconds("backpropagate", profile),
+            seconds("beam_select", profile),
+            seconds("best_extract", profile),
+            skip_elapsed,
+            commit_elapsed,
         )
 
     def _finalize_unassigned_groups(self) -> None:
