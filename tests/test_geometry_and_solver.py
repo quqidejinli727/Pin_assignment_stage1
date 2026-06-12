@@ -16,7 +16,7 @@ from PlaceDB import PlaceDB
 
 
 def write_case(tmp_path: Path) -> tuple[Path, Path]:
-    """生成一个最小可运行测试用例，覆盖复用 block 和同构 Pin。"""
+    """Test helper."""
     block = {
         "name": "TOP",
         "module_name": "TOP",
@@ -96,7 +96,7 @@ def write_case(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def test_vertex_alignment_handles_cyclic_start():
-    """验证顶点起点变化时仍能对齐到 reference 顶点顺序。"""
+    """Test helper."""
     reference = [[0, 0], [20, 0], [20, 10], [0, 10]]
     shifted = [[20, 10], [0, 10], [0, 0], [20, 0]]
     aligned = align_vertices_to_reference(reference, shifted, 0)
@@ -105,7 +105,7 @@ def test_vertex_alignment_handles_cyclic_start():
 
 
 def test_square_alignment_uses_direction_when_reference_is_rotated():
-    """验证正方形 reference 旋转时仍按基础坐标确定对应边。"""
+    """Test helper."""
     reference_r180 = [[20, 20], [10, 20], [10, 10], [20, 10]]
     base_instance = [[0, 0], [10, 0], [10, 10], [0, 10]]
     aligned = align_vertices_to_reference(
@@ -119,7 +119,7 @@ def test_square_alignment_uses_direction_when_reference_is_rotated():
 
 
 def test_placedb_indexes_and_segment_mapping(tmp_path):
-    """验证 PlaceDB 索引和 segment 实例映射能正确建立。"""
+    """Test helper."""
     block_path, pingroup_path = write_case(tmp_path)
     placedb = PlaceDB(str(block_path), str(pingroup_path))
     segments = SegmentManager(placedb)
@@ -392,7 +392,7 @@ def test_zero_coverage_threshold_disables_uncovered_group_skip(tmp_path):
 
 
 def test_solver_assigns_all_pins_and_respects_capacity(tmp_path):
-    """验证正常场景下所有 Pin 都完成分配且不超容量。"""
+    """Test helper."""
     block_path, pingroup_path = write_case(tmp_path)
     solver = AssignmentSolver(str(block_path), str(pingroup_path), simulations=32)
     result = solver.solve()
@@ -415,7 +415,7 @@ def test_solver_assigns_all_pins_and_respects_capacity(tmp_path):
 
 
 def test_solver_supports_basic_mcts_search_mode(tmp_path):
-    """验证 config 可切换到基础版 MCTS 搜索流程。"""
+    """Test helper."""
     block_path, pingroup_path = write_case(tmp_path)
     solver = AssignmentSolver(
         str(block_path),
@@ -584,16 +584,20 @@ def write_low_committable_case(tmp_path: Path) -> tuple[Path, Path]:
     return block_path, pingroup_path
 
 
-def test_low_committable_ratio_skips_mcts_tree(tmp_path):
-    """Low committable/search group ratio should skip MCTS without assigning the seed."""
+def test_low_committable_ratio_still_builds_mcts_tree(tmp_path):
+    """Low committable/search group ratio should no longer skip local MCTS trees."""
     block_path, pingroup_path = write_low_committable_case(tmp_path)
+    calls = {"mcts": 0}
 
-    class FailingMCTS:
+    class FakeMCTS:
         def __init__(self, *args, **kwargs):
-            raise AssertionError("low-ratio tree should not construct MCTS")
+            calls["mcts"] += 1
+
+        def search(self):
+            return {"A.p": "A:S0", "B.p": "B:S0", "C.p": "C:S0", "D.p": "D:S0"}
 
     original_mcts = assignment_solver_module.MCTSSolver
-    assignment_solver_module.MCTSSolver = FailingMCTS
+    assignment_solver_module.MCTSSolver = FakeMCTS
     try:
         solver = AssignmentSolver(
             str(block_path),
@@ -601,19 +605,14 @@ def test_low_committable_ratio_skips_mcts_tree(tmp_path):
             simulations=2,
             enable_segment_subdivision=False,
             homology_group_commit_coverage_threshold=1.0,
-            mcts_tree_min_committable_group_ratio=0.3,
         )
         result = solver.solve()
     finally:
         assignment_solver_module.MCTSSolver = original_mcts
 
-    assert result["summary"]["skipped_mcts_tree_count"] == 4
-    assert result["summary"]["skipped_mcts_search_group_count"] == 16
-    assert result["summary"]["skipped_mcts_search_pin_count"] == 32
-    assert all(
-        item["committable_group_ratio"] <= 0.3
-        for item in result["skipped_mcts_trees"]
-    )
+    assert calls["mcts"] >= 1
+    assert "skipped_mcts_tree_count" not in result["summary"]
+    assert "skipped_mcts_trees" not in result
     assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
 
 
@@ -638,36 +637,30 @@ def test_high_committable_ratio_builds_mcts_tree(tmp_path):
             simulations=2,
             enable_segment_subdivision=False,
             homology_group_commit_coverage_threshold=1.0,
-            mcts_tree_min_committable_group_ratio=0.3,
         )
         result = solver.solve()
     finally:
         assignment_solver_module.MCTSSolver = original_mcts
 
     assert calls["mcts"] == 1
-    assert result["summary"]["skipped_mcts_tree_count"] == 0
+    assert "skipped_mcts_tree_count" not in result["summary"]
     assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
 
 
-def test_batch_analysis_uses_coverage_and_skip_thresholds(tmp_path):
-    """The analysis script should mirror low-ratio tree skipping."""
+def test_batch_analysis_does_not_skip_low_committable_trees(tmp_path):
+    """The analysis script should report low-yield trees instead of skipping them."""
     block_path, pingroup_path = write_low_committable_case(tmp_path)
 
     report = analyze_batches(
         block_path,
         pingroup_path,
         coverage_threshold=1.0,
-        min_committable_group_ratio=0.3,
     )
 
-    assert report["summary"]["mcts_tree_count"] == 0
-    assert report["summary"]["skipped_mcts_tree_count"] == 4
-    assert report["summary"]["skipped_mcts_search_group_count"] == 16
-    assert report["summary"]["skipped_mcts_search_pin_count"] == 32
-    assert all(
-        item["skipped_by_low_committable_ratio"]
-        for item in report["skipped_tree_reports"]
-    )
+    assert report["summary"]["mcts_tree_count"] == 4
+    assert "skipped_mcts_tree_count" not in report["summary"]
+    assert "skipped_tree_reports" not in report
+    assert report["tree_reports"][0]["committable_group_ratio_of_search_groups"] == 0.25
 
 
 def test_batch_analysis_true_skip_uses_effective_mcts_depth(tmp_path):
@@ -678,7 +671,6 @@ def test_batch_analysis_true_skip_uses_effective_mcts_depth(tmp_path):
         block_path,
         pingroup_path,
         coverage_threshold=0.0,
-        min_committable_group_ratio=0.3,
         skip_uncovered_groups=True,
         skip_coverage_threshold=1.0,
     )
@@ -774,13 +766,9 @@ def test_mcts_search_space_ignores_already_assigned_groups(tmp_path):
         basic_min_simulations=1,
         basic_depth1_simulations=0,
         basic_depth2_simulations=0,
-        typical_depth=3,
-        space_scale_divisor=10,
-        max_space_factor=10,
     )
 
     assert abs(mcts._total_search_space_factor(usage) - 1.6) < 1e-9
-    assert mcts._search_space_factor(usage) == 6.4
 
 
 def test_basic_mcts_dynamic_budget_has_floor_and_can_be_disabled(tmp_path):
@@ -1547,136 +1535,8 @@ def test_single_pin_nets_are_skipped_for_metric_feedthrough(tmp_path):
     assert summary["skipped_single_pin_net_count"] == 1
 
 
-def test_mcts_scaled_budget_and_tail_decay(tmp_path):
-    """验证新 MCTS 搜索预算公式和长尾衰减。"""
-    block_path, pingroup_path = write_case(tmp_path)
-    placedb = PlaceDB(str(block_path), str(pingroup_path))
-    segments = SegmentManager(placedb)
-    homology = HomologyManager(placedb)
-    groups = homology.unassigned_groups()
-    mcts = MCTSSolver(
-        placedb,
-        segments,
-        groups,
-        placedb.nets_list,
-        simulations=1000,
-        budget_decay=0.5,
-        tail_decay=0.8,
-        typical_depth=3,
-        space_scale_divisor=1000,
-        max_space_factor=10,
-        min_layer_simulations=1,
-        tail_depth=3,
-    )
-
-    usage = segments.snapshot_usage()
-    assert mcts._search_space_factor(usage) == 0.064
-    assert mcts._total_simulation_budget(usage) == 64
-    assert mcts._layer_budget(1000, 1) == 1000
-    assert mcts._layer_budget(1000, 2) == 500
-    assert mcts._layer_budget(1000, 3) == 250
-    assert mcts._layer_budget(1000, 4) == 200
-
-
-def test_mcts_layer_search_descends_one_child_per_level(tmp_path):
-    """验证逐层搜索每层只承诺一个子节点，剩余分配由贪心补全。"""
-    block_path, pingroup_path = write_case(tmp_path)
-    placedb = PlaceDB(str(block_path), str(pingroup_path))
-    segments = SegmentManager(placedb)
-    homology = HomologyManager(placedb)
-    groups = homology.unassigned_groups()
-    mcts = MCTSSolver(
-        placedb,
-        segments,
-        groups,
-        placedb.nets_list,
-        simulations=16,
-        min_layer_simulations=1,
-        typical_depth=1,
-        space_scale_divisor=1,
-        tail_depth=1,
-        enable_tail_early_stop=True,
-    )
-
-    calls = {"early_stop": 0}
-
-    def always_stop(_children):
-        calls["early_stop"] += 1
-        return True
-
-    mcts._has_decisive_ucb_lead = always_stop
-    assignment = mcts.search()
-
-    assert calls["early_stop"] == 1
-    assert set(assignment) == {group.name for group in groups}
-
-
-def test_mcts_tail_early_stop_can_be_disabled(tmp_path):
-    """验证禁用早停后，即使进入长尾也不会调用领先判断。"""
-    block_path, pingroup_path = write_case(tmp_path)
-    placedb = PlaceDB(str(block_path), str(pingroup_path))
-    segments = SegmentManager(placedb)
-    homology = HomologyManager(placedb)
-    groups = homology.unassigned_groups()
-    mcts = MCTSSolver(
-        placedb,
-        segments,
-        groups,
-        placedb.nets_list,
-        simulations=16,
-        min_layer_simulations=1,
-        typical_depth=1,
-        space_scale_divisor=1,
-        tail_depth=1,
-        enable_tail_early_stop=False,
-    )
-
-    def fail_if_called(_children):
-        raise AssertionError("early stop should be disabled")
-
-    mcts._has_decisive_ucb_lead = fail_if_called
-    assignment = mcts.search()
-
-    assert set(assignment) == {group.name for group in groups}
-
-
-def test_mcts_ucb_lead_uses_same_layer_std(tmp_path):
-    """验证长尾早停口径使用同层子节点 UCB 分数标准差。"""
-    block_path, pingroup_path = write_case(tmp_path)
-    placedb = PlaceDB(str(block_path), str(pingroup_path))
-    segments = SegmentManager(placedb)
-    homology = HomologyManager(placedb)
-    groups = homology.unassigned_groups()
-    mcts = MCTSSolver(
-        placedb,
-        segments,
-        groups,
-        placedb.nets_list,
-        early_stop_std_multiplier=2.0,
-    )
-    parent = MCTSNode(
-        group_index=0,
-        usage=segments.snapshot_usage(),
-        assignments={},
-        visits=100,
-    )
-    children = []
-    for total_reward in [10000.0, 0.0, 0.0]:
-        child = MCTSNode(
-            group_index=1,
-            usage=segments.snapshot_usage(),
-            assignments={},
-            parent=parent,
-            visits=10,
-            total_reward=total_reward,
-        )
-        children.append(child)
-
-    assert mcts._has_decisive_ucb_lead(children)
-
-
 def test_overflow_fallback_completes_assignment_when_pin_is_wider_than_edge(tmp_path):
-    """验证 Pin 宽度超过所有边时，overflow fallback 仍能完成分配并报告。"""
+    """Test helper."""
     block_path, pingroup_path = write_case(tmp_path)
     pingroup = json.loads(pingroup_path.read_text(encoding="utf-8"))
     pingroup[0][0]["width"] = 50.0

@@ -15,7 +15,7 @@ from scoring import metrics_to_records, summarize_metrics
 
 
 def parse_args() -> argparse.Namespace:
-    """解析可选命令行参数；未提供时使用 config.py 中的默认值。"""
+    """Internal helper."""
     parser = argparse.ArgumentParser(description="Run MCTS pin-to-segment assignment.")
     parser.add_argument("--block", default=None, help="Path to block JSON file.")
     parser.add_argument("--pingroup", default=None, help="Path to pingroup JSON file.")
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def config_from_args(args: argparse.Namespace) -> RunConfig:
-    """使用命令行临时覆盖集中配置中的对应参数。"""
+    """Internal helper."""
     return replace(
         DEFAULT_CONFIG,
         block_json_path=Path(args.block) if args.block else DEFAULT_CONFIG.block_json_path,
@@ -103,7 +103,7 @@ def write_run_report(
     assignment_summary: dict,
     metrics: list,
 ) -> Path:
-    """把单次运行参数和最终 Net 指标保存到独立结果目录。"""
+    """Internal helper."""
     run_name = datetime.now().strftime("run_%Y%m%d_%H%M%S_%f")
     run_dir = config.results_root / run_name
     run_dir.mkdir(parents=True, exist_ok=False)
@@ -122,7 +122,7 @@ def write_run_report(
 
 
 def run_pipline(config: RunConfig | None = None) -> Path:
-    """执行 Stage 1 分配流程，并返回可供后续阶段使用的结果路径。"""
+    """Internal helper."""
     if config is None:
         config = config_from_args(parse_args())
     solver = AssignmentSolver(
@@ -135,15 +135,6 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         segment_length_percentile=config.segment_length_percentile,
         mcts_search_mode=config.mcts_search_mode,
         mcts_enable_search_diagnostics=config.mcts_enable_search_diagnostics,
-        mcts_budget_decay=config.mcts_budget_decay,
-        mcts_tail_decay=config.mcts_tail_decay,
-        mcts_typical_depth=config.mcts_typical_depth,
-        mcts_space_scale_divisor=config.mcts_space_scale_divisor,
-        mcts_max_space_factor=config.mcts_max_space_factor,
-        mcts_min_layer_simulations=config.mcts_min_layer_simulations,
-        mcts_tail_depth=config.mcts_tail_depth,
-        mcts_early_stop_std_multiplier=config.mcts_early_stop_std_multiplier,
-        mcts_enable_tail_early_stop=config.mcts_enable_tail_early_stop,
         mcts_basic_dynamic_simulations=config.mcts_basic_dynamic_simulations,
         mcts_basic_space_scale_divisor=config.mcts_basic_space_scale_divisor,
         mcts_basic_max_space_factor=config.mcts_basic_max_space_factor,
@@ -175,7 +166,6 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         homology_skip_uncovered_groups=config.homology_skip_uncovered_groups,
         homology_skip_coverage_threshold=config.homology_skip_coverage_threshold,
         homology_group_commit_coverage_threshold=config.homology_group_commit_coverage_threshold,
-        mcts_tree_min_committable_group_ratio=config.mcts_tree_min_committable_group_ratio,
         mcts_enable_candidate_pruning=config.mcts_enable_candidate_pruning,
         mcts_candidate_top_k=config.mcts_candidate_top_k,
         mcts_candidate_tail_top_k=config.mcts_candidate_tail_top_k,

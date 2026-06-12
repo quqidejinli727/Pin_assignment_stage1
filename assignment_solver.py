@@ -30,15 +30,6 @@ class AssignmentSolver:
         segment_length_percentile: int = 50,
         mcts_search_mode: str = "hybrid",
         mcts_enable_search_diagnostics: bool = False,
-        mcts_budget_decay: float = 0.6,
-        mcts_tail_decay: float = 0.9,
-        mcts_typical_depth: int = 6,
-        mcts_space_scale_divisor: float = 1_000_000.0,
-        mcts_max_space_factor: float = 10.0,
-        mcts_min_layer_simulations: int = 256,
-        mcts_tail_depth: int = 8,
-        mcts_early_stop_std_multiplier: float = 2.0,
-        mcts_enable_tail_early_stop: bool = True,
         mcts_basic_dynamic_simulations: bool = True,
         mcts_basic_space_scale_divisor: float = 100_000.0,
         mcts_basic_max_space_factor: float = 8.0,
@@ -69,7 +60,6 @@ class AssignmentSolver:
         homology_skip_uncovered_groups: bool = False,
         homology_skip_coverage_threshold: float = 1.0,
         homology_group_commit_coverage_threshold: float = 1.0,
-        mcts_tree_min_committable_group_ratio: float = 0.3,
         mcts_enable_candidate_pruning: bool = True,
         mcts_candidate_top_k: int = 12,
         mcts_candidate_tail_top_k: int = 8,
@@ -128,20 +118,9 @@ class AssignmentSolver:
         self.homology_skip_uncovered_groups = homology_skip_uncovered_groups
         self.homology_skip_coverage_threshold = homology_skip_coverage_threshold
         self.homology_group_commit_coverage_threshold = homology_group_commit_coverage_threshold
-        self.mcts_tree_min_committable_group_ratio = mcts_tree_min_committable_group_ratio
-        self.skipped_mcts_trees: List[Dict[str, object]] = []
         self.mcts_options = {
             "search_mode": mcts_search_mode,
             "enable_search_diagnostics": mcts_enable_search_diagnostics,
-            "budget_decay": mcts_budget_decay,
-            "tail_decay": mcts_tail_decay,
-            "typical_depth": mcts_typical_depth,
-            "space_scale_divisor": mcts_space_scale_divisor,
-            "max_space_factor": mcts_max_space_factor,
-            "min_layer_simulations": mcts_min_layer_simulations,
-            "tail_depth": mcts_tail_depth,
-            "early_stop_std_multiplier": mcts_early_stop_std_multiplier,
-            "enable_tail_early_stop": mcts_enable_tail_early_stop,
             "basic_dynamic_simulations": mcts_basic_dynamic_simulations,
             "basic_space_scale_divisor": mcts_basic_space_scale_divisor,
             "basic_max_space_factor": mcts_basic_max_space_factor,
@@ -233,19 +212,6 @@ class AssignmentSolver:
                 )
                 if not self.homology_skip_uncovered_groups:
                     skipped_group_names = set()
-                committable_group_ratio = self._group_ratio(
-                    len(committable_groups),
-                    len(related_groups),
-                )
-                if committable_group_ratio <= self.mcts_tree_min_committable_group_ratio:
-                    self._record_skipped_mcts_tree(
-                        seed_group,
-                        related_groups,
-                        committable_groups,
-                        committable_group_ratio,
-                    )
-                    continue
-
                 budget = (
                     self.simulations
                     if self.simulations is not None
@@ -409,36 +375,6 @@ class AssignmentSolver:
             if coverage_ratio < threshold:
                 skipped.add(group.name)
         return skipped
-
-    def _record_skipped_mcts_tree(
-        self,
-        seed_group: PinHomologyGroup,
-        related_groups: List[PinHomologyGroup],
-        committable_groups: List[PinHomologyGroup],
-        committable_group_ratio: float,
-    ) -> None:
-        """Record one low-yield local MCTS tree candidate skipped before search."""
-        self.skipped_mcts_trees.append(
-            {
-                "seed_group": seed_group.name,
-                "search_group_count": len(related_groups),
-                "committable_group_count": len(committable_groups),
-                "committable_group_ratio": committable_group_ratio,
-                "search_pin_count": self._group_pin_count(related_groups),
-                "committable_pin_count": self._group_pin_count(committable_groups),
-                "threshold": self.mcts_tree_min_committable_group_ratio,
-            }
-        )
-
-    @staticmethod
-    def _group_pin_count(groups: List[PinHomologyGroup]) -> int:
-        """Return the total number of pins in a list of homology groups."""
-        return sum(len(group.pins) for group in groups)
-
-    @staticmethod
-    def _group_ratio(numerator: int, denominator: int) -> float:
-        """Return a safe group-count ratio."""
-        return numerator / denominator if denominator else 0.0
 
     def _validate_segment_assignment(
         self,
@@ -605,12 +541,6 @@ class AssignmentSolver:
             for group in self.homology.unassigned_groups()
         ]
         capacity_violations = self.segment_manager.capacity_violations()
-        skipped_mcts_search_group_count = sum(
-            int(item["search_group_count"]) for item in self.skipped_mcts_trees
-        )
-        skipped_mcts_search_pin_count = sum(
-            int(item["search_pin_count"]) for item in self.skipped_mcts_trees
-        )
         return {
             "summary": {
                 "module_count": len(self.placedb.all_modules_list),
@@ -624,14 +554,10 @@ class AssignmentSolver:
                 "capacity_violation_count": len(capacity_violations),
                 "assignment_rounds": self.assignment_rounds,
                 "total_mcts_simulations": self.total_mcts_simulations,
-                "skipped_mcts_tree_count": len(self.skipped_mcts_trees),
-                "skipped_mcts_search_group_count": skipped_mcts_search_group_count,
-                "skipped_mcts_search_pin_count": skipped_mcts_search_pin_count,
                 "max_segment_length": self.max_segment_length,
             },
             "unassigned_groups": unassigned_groups,
             "assignment_issues": self.assignment_issues,
-            "skipped_mcts_trees": self.skipped_mcts_trees,
             "capacity_violations": capacity_violations,
             "segments": self.segment_manager.to_output_dict(),
         }

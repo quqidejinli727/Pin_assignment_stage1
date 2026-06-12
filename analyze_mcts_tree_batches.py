@@ -84,7 +84,6 @@ def analyze_batches(
     block_json: str | Path,
     pingroup_json: str | Path,
     coverage_threshold: float = DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
-    min_committable_group_ratio: float = DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
     use_fanout_reuse_for_sorting: bool = DEFAULT_CONFIG.homology_use_fanout_reuse_for_sorting,
     skip_uncovered_groups: bool = DEFAULT_CONFIG.homology_skip_uncovered_groups,
     skip_coverage_threshold: float = DEFAULT_CONFIG.homology_skip_coverage_threshold,
@@ -96,7 +95,6 @@ def analyze_batches(
     )
 
     tree_reports: List[dict] = []
-    skipped_tree_reports: List[dict] = []
     non_mcts_assignments: List[dict] = []
     tree_index = 0
     candidate_tree_index = 0
@@ -213,9 +211,6 @@ def analyze_batches(
                 ),
                 "deferred_group_count": len(deferred_groups),
                 "deferred_pin_count": _group_pin_count(deferred_groups),
-                "skipped_by_low_committable_ratio": (
-                    committable_group_ratio <= min_committable_group_ratio
-                ),
                 "search_groups": _group_records(effective_search_groups),
                 "raw_search_groups": _group_records(related_groups),
                 "committable_groups": _group_records(effective_committable_groups),
@@ -223,12 +218,6 @@ def analyze_batches(
                 "deferred_groups": _group_records(deferred_groups),
                 "true_skipped_groups": _group_records(skipped_groups),
             }
-
-            if report["skipped_by_low_committable_ratio"]:
-                report["tree_index"] = None
-                skipped_tree_reports.append(report)
-                candidate_tree_index += 1
-                continue
 
             tree_reports.append(report)
             current_tree_index = tree_index
@@ -253,9 +242,6 @@ def analyze_batches(
     final_greedy_pin_count = _group_pin_count(final_greedy_groups)
     total_search_pin_count = sum(search_pin_values)
     total_committable_pin_count = sum(committable_pin_values)
-    skipped_search_group_count = sum(report["search_group_count"] for report in skipped_tree_reports)
-    skipped_search_pin_count = sum(report["search_pin_count"] for report in skipped_tree_reports)
-
     return {
         "input": {
             "block_json": str(Path(block_json)),
@@ -264,7 +250,6 @@ def analyze_batches(
         "parameters": {
             "use_fanout_reuse_for_sorting": use_fanout_reuse_for_sorting,
             "coverage_threshold": coverage_threshold,
-            "min_committable_group_ratio": min_committable_group_ratio,
             "skip_uncovered_groups": skip_uncovered_groups,
             "skip_coverage_threshold": skip_coverage_threshold,
         },
@@ -289,15 +274,6 @@ def analyze_batches(
             "true_skipped_pin_visits": sum(
                 report["true_skipped_pin_count"] for report in tree_reports
             ),
-            "skipped_mcts_tree_count": len(skipped_tree_reports),
-            "skipped_mcts_search_group_count": skipped_search_group_count,
-            "skipped_mcts_search_pin_count": skipped_search_pin_count,
-            "skipped_mcts_raw_search_group_count": sum(
-                report["raw_search_group_count"] for report in skipped_tree_reports
-            ),
-            "skipped_mcts_raw_search_pin_count": sum(
-                report["raw_search_pin_count"] for report in skipped_tree_reports
-            ),
             "final_greedy_group_count": len(final_greedy_groups),
             "final_greedy_pin_count": final_greedy_pin_count,
             "non_mcts_assignment_count": len(non_mcts_assignments),
@@ -312,7 +288,6 @@ def analyze_batches(
         },
         "depth_histogram": _histogram(depth_values),
         "tree_reports": tree_reports,
-        "skipped_tree_reports": skipped_tree_reports,
         "non_mcts_assignments": non_mcts_assignments,
         "final_greedy_groups": _group_records(final_greedy_groups),
     }
@@ -360,12 +335,6 @@ def main() -> None:
         help="Whether multi-fanout pins boost homology sorting reuse count.",
     )
     parser.add_argument(
-        "--min-committable-group-ratio",
-        type=float,
-        default=DEFAULT_CONFIG.mcts_tree_min_committable_group_ratio,
-        help="Skip a candidate MCTS tree when committable/search group ratio is <= this value.",
-    )
-    parser.add_argument(
         "--skip-uncovered-groups",
         action=argparse.BooleanOptionalAction,
         default=DEFAULT_CONFIG.homology_skip_uncovered_groups,
@@ -384,7 +353,6 @@ def main() -> None:
         args.pingroup,
         use_fanout_reuse_for_sorting=args.fanout_reuse_sorting,
         coverage_threshold=args.coverage_threshold,
-        min_committable_group_ratio=args.min_committable_group_ratio,
         skip_uncovered_groups=args.skip_uncovered_groups,
         skip_coverage_threshold=args.skip_coverage_threshold,
     )
