@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Set
 
@@ -15,7 +16,7 @@ from segment_subdivision import percentile_edge_length
 
 
 class AssignmentSolver:
-    """串联解析、同构分组、MCTS 搜索、实际提交和结果输出。"""
+    """Coordinate PlaceDB, homology grouping, MCTS search, commit, and export."""
 
     def __init__(
         self,
@@ -86,7 +87,7 @@ class AssignmentSolver:
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
     ):
-        """初始化数据库、同构管理器、segment 管理器和求解参数。"""
+        """Initialize data managers and solver parameters."""
         self.placedb = PlaceDB(block_json_path, pingroup_json_path)
         self.homology = HomologyManager(
             self.placedb,
@@ -181,10 +182,13 @@ class AssignmentSolver:
         }
         self.assignment_rounds = 0
         self.assignment_progress_index = 0
+        self.assignment_log_interval = 100
+        self.assignment_progress_pin_count = 0
+        self.total_mcts_simulations = 0
         self.assignment_issues: List[Dict[str, object]] = []
 
     def solve(self) -> Dict[str, object]:
-        """执行完整分配流程，并返回最终输出数据结构。"""
+        """Run the full assignment flow and return the output dictionary."""
         self._open_feedthrough_context_if_needed()
         try:
             return self._solve_with_open_context()
@@ -259,6 +263,7 @@ class AssignmentSolver:
                     **self.mcts_options,
                 )
                 proposed_assignment = mcts.search()
+                self.total_mcts_simulations += getattr(mcts, "last_simulation_count", 0)
                 committed_count = self._commit_contained_groups(
                     related_groups,
                     pins_in,
@@ -334,7 +339,7 @@ class AssignmentSolver:
         )
 
     def _collect_pins(self, nets: List[Net]) -> List[Pin]:
-        """从一批 Net 中收集去重后的 pins_in。"""
+        """Collect unique pins from a set of nets."""
         pins_by_name: Dict[str, Pin] = {}
         for net in nets:
             for pin in net.pins:
@@ -347,7 +352,7 @@ class AssignmentSolver:
         pins_in: List[Pin],
         proposed_assignment: Dict[str, str],
     ) -> int:
-        """提交当前 pins_in 中完整包含的同构组分配结果。"""
+        """Commit groups represented by the current pins_in set."""
         pin_full_names: Set[str] = {pin.full_name for pin in pins_in}
         contained_groups = self._committable_groups(related_groups, pin_full_names)
         committed_count = 0
@@ -440,7 +445,7 @@ class AssignmentSolver:
         group: PinHomologyGroup,
         segment_id: str,
     ) -> str | None:
-        """校验 MCTS 给出的 segment 是否存在、类型匹配且容量可用。"""
+        """Validate that the proposed segment can be used by the group."""
         segment = self.segment_manager.abstract_segments.get(segment_id)
         if segment is None:
             return "invalid_mcts_segment"
@@ -454,7 +459,7 @@ class AssignmentSolver:
         return None
 
     def _assign_group_greedily(self, group: PinHomologyGroup, fallback_reason: str) -> bool:
-        """在 MCTS 未给出可提交方案时，用贪心策略兜底分配。"""
+        """Assign a group with the reward-aware greedy fallback."""
         if group.assigned:
             return True
         candidates = self.segment_manager.candidates_for_module(group.module_name)
@@ -545,7 +550,7 @@ class AssignmentSolver:
         segment_id: str,
         allow_overflow: bool = False,
     ) -> None:
-        """把单个同构组实际写入 segment，并更新同构分配状态。"""
+        """Commit one homology group to a real segment."""
         self.segment_manager.apply_assignment(
             group.name,
             group.pins,
@@ -556,15 +561,18 @@ class AssignmentSolver:
         self._print_assignment_progress(group)
 
     def _print_assignment_progress(self, group: PinHomologyGroup) -> None:
-        """打印同构组分配进度，编号按实际分配顺序从 0 开始。"""
-        print(
-            f"homology_batch_index={self.assignment_progress_index}, "
-            f"group={group.name}, pin_count={len(group.pins)}"
-        )
         self.assignment_progress_index += 1
+        self.assignment_progress_pin_count += len(group.pins)
+        if self.assignment_progress_index % self.assignment_log_interval == 0:
+            print(
+                f"time={datetime.now().isoformat(timespec='seconds')}, "
+                f"assigned_homology_count={self.assignment_progress_index}, "
+                f"assigned_pin_count={self.assignment_progress_pin_count}, "
+                f"total_mcts_simulations={self.total_mcts_simulations}"
+            )
 
     def _finalize_unassigned_groups(self) -> None:
-        """最终扫描所有未分配组，尽量用兜底策略完成分配。"""
+        """Sweep all remaining groups with the fallback assignment."""
         for group in self.homology.unassigned_groups():
             self._assign_group_greedily(group, "final_unassigned_sweep")
 
@@ -574,7 +582,7 @@ class AssignmentSolver:
         reason: str,
         detail: str,
     ) -> None:
-        """记录分配异常或 overflow 兜底，便于输出诊断。"""
+        """Record assignment issues for diagnostics."""
         self.assignment_issues.append(
             {
                 "group": group.name,
@@ -586,7 +594,7 @@ class AssignmentSolver:
         )
 
     def build_output(self) -> Dict[str, object]:
-        """构建包含 summary、诊断信息和 segment 结果的输出字典。"""
+        """Build the final output dictionary."""
         assigned_pin_count = sum(1 for pin in self.placedb.pin_dict.values() if pin.assigned_segment_id)
         unassigned_groups = [
             {
@@ -615,6 +623,7 @@ class AssignmentSolver:
                 "assignment_issue_count": len(self.assignment_issues),
                 "capacity_violation_count": len(capacity_violations),
                 "assignment_rounds": self.assignment_rounds,
+                "total_mcts_simulations": self.total_mcts_simulations,
                 "skipped_mcts_tree_count": len(self.skipped_mcts_trees),
                 "skipped_mcts_search_group_count": skipped_mcts_search_group_count,
                 "skipped_mcts_search_pin_count": skipped_mcts_search_pin_count,
@@ -628,7 +637,7 @@ class AssignmentSolver:
         }
 
     def write_output(self, output_path: str) -> Dict[str, object]:
-        """运行求解并把输出 JSON 写到指定路径。"""
+        """Run the solver and write output JSON."""
         try:
             result = self.solve()
             path = Path(output_path)
@@ -637,3 +646,4 @@ class AssignmentSolver:
             return result
         finally:
             self.close_feedthrough_context()
+

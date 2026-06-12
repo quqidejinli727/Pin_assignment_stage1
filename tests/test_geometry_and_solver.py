@@ -1,5 +1,7 @@
 import json
 import math
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 import assignment_solver as assignment_solver_module
@@ -305,6 +307,48 @@ def test_mcts_skip_groups_do_not_inflate_search_profile(tmp_path):
     assignments = {groups[0].name: "__SKIP_UNCOVERED_GROUP__"}
     locations = mcts._temporary_locations(assignments)
     assert all(pin.full_name not in locations for pin in groups[0].pins)
+
+
+def test_assignment_progress_log_batches_every_100_groups(tmp_path):
+    """Assignment progress logging is batched instead of per homology group."""
+    block_path, pingroup_path = write_case(tmp_path)
+    solver = AssignmentSolver(str(block_path), str(pingroup_path), simulations=2)
+    group = solver.homology.unassigned_groups()[0]
+    solver.total_mcts_simulations = 1234
+    output = StringIO()
+
+    with redirect_stdout(output):
+        for _ in range(99):
+            solver._print_assignment_progress(group)
+        assert output.getvalue() == ""
+        solver._print_assignment_progress(group)
+
+    text = output.getvalue()
+    assert "assigned_homology_count=100" in text
+    assert "total_mcts_simulations=1234" in text
+    assert "homology_batch_index" not in text
+
+
+def test_mcts_records_actual_simulation_count(tmp_path):
+    """MCTS exposes the actual number of rollout simulations used by one search."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        homology.unassigned_groups(),
+        placedb.nets_list,
+        simulations=5,
+        search_mode="basic",
+        basic_dynamic_simulations=False,
+        feedthrough_weight=0.0,
+    )
+
+    mcts.search()
+
+    assert mcts.last_simulation_count == 5
 
 
 def test_skip_assignment_is_not_committed_or_greedy_fallback(tmp_path):

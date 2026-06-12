@@ -181,6 +181,7 @@ class MCTSSolver:
         self._candidate_score_cache: Dict[Tuple[str, str], float] = {}
         self.last_search_profile: SearchProfile | None = None
         self.last_search_diagnostics: Dict[str, object] = {}
+        self.last_simulation_count = 0
         self.reward_evaluator = RewardEvaluator(
             self.nets,
             self.placedb,
@@ -195,6 +196,7 @@ class MCTSSolver:
 
     def search(self) -> Dict[str, str]:
         """执行已配置的 MCTS 搜索策略。"""
+        self.last_simulation_count = 0
         try:
             if self.groups and not any(
                 not group.assigned and not self._is_skipped_group(group)
@@ -831,6 +833,7 @@ class MCTSSolver:
 
     def _simulate(self, node: MCTSNode) -> float:
         """从当前节点开始随机补全剩余分配并计算 reward。"""
+        self.last_simulation_count += 1
         usage = node.usage.clone()
         assignments = dict(node.assignments)
         for index in range(node.group_index, len(self.groups)):
