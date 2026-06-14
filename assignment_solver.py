@@ -219,20 +219,36 @@ class AssignmentSolver:
                 if not self.homology_skip_uncovered_groups:
                     skipped_group_names = set()
                 skip_elapsed = time.perf_counter() - skip_started
+                search_groups = [
+                    group for group in related_groups if group.name not in skipped_group_names
+                ]
+                effective_committable_groups = [
+                    group for group in committable_groups if group.name not in skipped_group_names
+                ]
+                skipped_pin_names = {
+                    pin.full_name
+                    for group in related_groups
+                    if group.name in skipped_group_names
+                    for pin in group.pins
+                }
+                if not search_groups:
+                    self.assignment_rounds += 1
+                    continue
                 budget = (
                     self.simulations
                     if self.simulations is not None
-                    else get_simulation_budget(len(related_groups))
+                    else get_simulation_budget(len(search_groups))
                 )
                 mcts = MCTSSolver(
                     placedb=self.placedb,
                     segment_manager=self.segment_manager,
-                    groups=related_groups,
+                    groups=search_groups,
                     nets=nets,
                     simulations=budget,
                     random_seed=self.random_seed + self.assignment_rounds,
                     feedthrough_context=self.feedthrough_context,
                     skipped_group_names=skipped_group_names,
+                    skipped_pin_names=skipped_pin_names,
                     **self.mcts_options,
                 )
                 search_started = time.perf_counter()
@@ -241,7 +257,7 @@ class AssignmentSolver:
                 self.total_mcts_simulations += getattr(mcts, "last_simulation_count", 0)
                 commit_started = time.perf_counter()
                 committed_count = self._commit_contained_groups(
-                    related_groups,
+                    search_groups,
                     pins_in,
                     proposed_assignment,
                 )
@@ -253,7 +269,7 @@ class AssignmentSolver:
                     search_elapsed=search_elapsed,
                     commit_elapsed=commit_elapsed,
                     related_group_count=len(related_groups),
-                    committable_group_count=len(committable_groups),
+                    committable_group_count=len(effective_committable_groups),
                     skipped_group_count=len(skipped_group_names),
                     committed_count=committed_count,
                 )

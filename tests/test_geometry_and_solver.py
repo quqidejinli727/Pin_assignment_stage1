@@ -309,6 +309,112 @@ def test_mcts_skip_groups_do_not_inflate_search_profile(tmp_path):
     assert all(pin.full_name not in locations for pin in groups[0].pins)
 
 
+def test_solver_true_skip_excludes_groups_from_mcts_tree(tmp_path):
+    """True-skip groups should not be passed into the current MCTS tree."""
+    block = {
+        "name": "TOP",
+        "module_name": "TOP",
+        "direction": 0,
+        "color": "#000000",
+        "vertex": [[0, 0], [200, 0], [200, 80], [0, 80]],
+        "children": [
+            {
+                "name": f"TOP.U_S{index}",
+                "module_name": "S",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[index * 20, 0], [index * 20 + 10, 0], [index * 20 + 10, 10], [index * 20, 10]],
+                "children": [],
+            }
+            for index in range(3)
+        ]
+        + [
+            {
+                "name": f"TOP.U_T{index}",
+                "module_name": "T",
+                "direction": 0,
+                "color": "#bbbbbb",
+                "vertex": [[80 + index * 20, 0], [90 + index * 20, 0], [90 + index * 20, 10], [80 + index * 20, 10]],
+                "children": [],
+            }
+            for index in range(2)
+        ],
+    }
+    pingroup = [
+        [
+            {
+                "parent_inst": f"TOP.U_S{index}",
+                "parent_module": "S",
+                "pingroup_name": "seed",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+            for index in range(3)
+        ]
+        + [
+            {
+                "parent_inst": "TOP.U_T0",
+                "parent_module": "T",
+                "pingroup_name": "partial",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_T1",
+                "parent_module": "T",
+                "pingroup_name": "partial",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+        ],
+    ]
+    block_path = tmp_path / "block.json"
+    pingroup_path = tmp_path / "pingroup.json"
+    block_path.write_text(json.dumps(block), encoding="utf-8")
+    pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
+
+    calls = []
+    original_mcts = assignment_solver_module.MCTSSolver
+
+    class FakeMCTS:
+        def __init__(self, *args, **kwargs):
+            self.groups = kwargs["groups"]
+            self.skipped_group_names = set(kwargs.get("skipped_group_names", set()))
+            self.skipped_pin_names = set(kwargs.get("skipped_pin_names", set()))
+            self.last_simulation_count = 0
+            self.timing_profile = {}
+            self.reward_evaluator = type("FakeReward", (), {"timing_profile": {}})()
+            calls.append(self)
+
+        def search(self):
+            return {}
+
+    assignment_solver_module.MCTSSolver = FakeMCTS
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=1,
+            homology_skip_uncovered_groups=True,
+            homology_skip_coverage_threshold=1.0,
+            homology_group_commit_coverage_threshold=1.0,
+            feedthrough_weight=0.0,
+        )
+        solver.solve()
+    finally:
+        assignment_solver_module.MCTSSolver = original_mcts
+
+    first_call = calls[0]
+    assert [group.name for group in first_call.groups] == ["S.seed"]
+    assert first_call.skipped_group_names == {"T.partial"}
+    assert first_call.skipped_pin_names == {"TOP.U_T0.partial", "TOP.U_T1.partial"}
+
+
 def test_assignment_progress_log_batches_every_100_groups(tmp_path):
     """Assignment progress logging is batched instead of per homology group."""
     block_path, pingroup_path = write_case(tmp_path)

@@ -109,6 +109,7 @@ class MCTSSolver:
         enable_feedthrough: bool = True,
         feedthrough_context: FeedthroughContext | None = None,
         skipped_group_names: Iterable[str] | None = None,
+        skipped_pin_names: Iterable[str] | None = None,
     ):
         """Internal helper."""
         self.placedb = placedb
@@ -116,12 +117,13 @@ class MCTSSolver:
         self.groups = groups
         self.nets = list(nets)
         self.skipped_group_names = set(skipped_group_names or [])
-        self.skipped_pin_names = {
+        group_skipped_pin_names = {
             pin.full_name
             for group in self.groups
             if group.name in self.skipped_group_names
             for pin in group.pins
         }
+        self.skipped_pin_names = set(skipped_pin_names or group_skipped_pin_names)
         self.simulations = simulations
         self.exploration_constant = exploration_constant
         self.random = random.Random(random_seed)
