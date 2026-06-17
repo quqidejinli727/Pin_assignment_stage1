@@ -415,8 +415,8 @@ def test_solver_true_skip_excludes_groups_from_mcts_tree(tmp_path):
     assert first_call.skipped_pin_names == {"TOP.U_T0.partial", "TOP.U_T1.partial"}
 
 
-def test_assignment_progress_log_batches_every_100_groups(tmp_path):
-    """Assignment progress logging is batched instead of per homology group."""
+def test_assignment_progress_no_longer_emits_periodic_log(tmp_path):
+    """Assignment progress counters should not emit the old periodic log."""
     block_path, pingroup_path = write_case(tmp_path)
     solver = AssignmentSolver(str(block_path), str(pingroup_path), simulations=2)
     group = solver.homology.unassigned_groups()[0]
@@ -437,10 +437,7 @@ def test_assignment_progress_log_batches_every_100_groups(tmp_path):
         logger.removeHandler(handler)
         logger.setLevel(old_level)
 
-    text = output.getvalue()
-    assert "assigned_homology_count=100" in text
-    assert "total_mcts_simulations=1234" in text
-    assert "homology_batch_index" not in text
+    assert output.getvalue() == ""
 
 
 def test_mcts_records_actual_simulation_count(tmp_path):

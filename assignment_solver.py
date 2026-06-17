@@ -187,6 +187,10 @@ class AssignmentSolver:
             for seed_group in self.homology.unassigned_groups():
                 if seed_group.assigned:
                     continue
+                tree_build_started = time.perf_counter()
+                prior_assigned_group_count = sum(
+                    1 for group in self.homology.pin_groups.values() if group.assigned
+                )
                 nets = self.homology.get_related_nets(seed_group)
                 if not nets:
                     made_progress = self._assign_group_greedily(
@@ -234,6 +238,7 @@ class AssignmentSolver:
                 if not search_groups:
                     self.assignment_rounds += 1
                     continue
+                tree_build_elapsed = time.perf_counter() - tree_build_started
                 budget = (
                     self.simulations
                     if self.simulations is not None
@@ -268,9 +273,12 @@ class AssignmentSolver:
                     skip_elapsed=skip_elapsed,
                     search_elapsed=search_elapsed,
                     commit_elapsed=commit_elapsed,
+                    tree_build_elapsed=tree_build_elapsed,
                     related_group_count=len(related_groups),
+                    search_group_count=len(search_groups),
                     committable_group_count=len(effective_committable_groups),
                     skipped_group_count=len(skipped_group_names),
+                    prior_assigned_group_count=prior_assigned_group_count,
                     committed_count=committed_count,
                 )
                 made_progress = committed_count > 0 or made_progress
@@ -537,15 +545,6 @@ class AssignmentSolver:
     def _print_assignment_progress(self, group: PinHomologyGroup) -> None:
         self.assignment_progress_index += 1
         self.assignment_progress_pin_count += len(group.pins)
-        if self.assignment_progress_index % self.assignment_log_interval == 0:
-            logger.info(
-                "assignment_progress time=%s assigned_homology_count=%d "
-                "assigned_pin_count=%d total_mcts_simulations=%d",
-                datetime.now().isoformat(timespec="seconds"),
-                self.assignment_progress_index,
-                self.assignment_progress_pin_count,
-                self.total_mcts_simulations,
-            )
 
     def _print_mcts_timing_log(
         self,
@@ -554,51 +553,62 @@ class AssignmentSolver:
         skip_elapsed: float,
         search_elapsed: float,
         commit_elapsed: float,
+        tree_build_elapsed: float,
         related_group_count: int,
+        search_group_count: int,
         committable_group_count: int,
         skipped_group_count: int,
+        prior_assigned_group_count: int,
         committed_count: int,
     ) -> None:
         profile = getattr(mcts, "timing_profile", {})
         reward_profile = getattr(getattr(mcts, "reward_evaluator", None), "timing_profile", {})
 
-        def seconds(key: str, source: Dict[str, float]) -> str:
-            return f"{source.get(key, 0.0):.6f}"
+        def elapsed(key: str, source: Dict[str, float]) -> float:
+            return source.get(key, 0.0)
+
+        search_total = elapsed("search_total", profile)
+        reward_total = elapsed("reward_total", reward_profile)
+        reward_wrapped = elapsed("reward", profile)
+        mcts_main_elapsed = max(0.0, search_total - reward_wrapped)
 
         logger.info(
-            "mcts_timing time=%s round=%d seed_group=%s groups=%d "
-            "committable_groups=%d true_skipped_groups=%d committed_groups=%d "
-            "simulations=%d search_wall_s=%.6f search_total_s=%s select_s=%s "
-            "expand_s=%s child_generation_s=%s simulate_s=%s "
-            "simulate_completion_s=%s temporary_locations_s=%s reward_s=%s "
-            "reward_total_s=%s reward_hpwl_s=%s reward_ft_s=%s "
-            "reward_ft_location_s=%s reward_ft_eval_s=%s backpropagate_s=%s "
-            "beam_select_s=%s best_extract_s=%s true_skip_check_s=%.6f commit_s=%.6f",
-            datetime.now().isoformat(timespec="seconds"),
+            "mcts_tree round=%d time=%s seed_group=%s "
+            "tree_build_s=%.6f search_wall_s=%.6f "
+            "related_groups=%d search_groups=%d committable_groups=%d "
+            "skipped_groups=%d prior_assigned_groups=%d committed_groups=%d "
+            "simulations=%d mcts_main_s=%.6f reward_total_s=%.6f "
+            "reward_hpwl_s=%.6f reward_ft_s=%.6f "
+            "select_s=%.6f expand_s=%.6f child_generation_s=%.6f "
+            "simulate_s=%.6f simulate_completion_s=%.6f "
+            "temporary_locations_s=%.6f backpropagate_s=%.6f "
+            "beam_select_s=%.6f best_extract_s=%.6f "
+            "true_skip_check_s=%.6f commit_s=%.6f",
             self.assignment_rounds,
+            datetime.now().isoformat(timespec="seconds"),
             seed_group.name,
+            tree_build_elapsed,
+            search_elapsed,
             related_group_count,
+            search_group_count,
             committable_group_count,
             skipped_group_count,
+            prior_assigned_group_count,
             committed_count,
             getattr(mcts, "last_simulation_count", 0),
-            search_elapsed,
-            seconds("search_total", profile),
-            seconds("select", profile),
-            seconds("expand", profile),
-            seconds("child_generation", profile),
-            seconds("simulate", profile),
-            seconds("simulate_completion", profile),
-            seconds("temporary_locations", profile),
-            seconds("reward", profile),
-            seconds("reward_total", reward_profile),
-            seconds("reward_hpwl", reward_profile),
-            seconds("reward_feedthrough", reward_profile),
-            seconds("reward_feedthrough_location", reward_profile),
-            seconds("reward_feedthrough_eval", reward_profile),
-            seconds("backpropagate", profile),
-            seconds("beam_select", profile),
-            seconds("best_extract", profile),
+            mcts_main_elapsed,
+            reward_total,
+            elapsed("reward_hpwl", reward_profile),
+            elapsed("reward_feedthrough", reward_profile),
+            elapsed("select", profile),
+            elapsed("expand", profile),
+            elapsed("child_generation", profile),
+            elapsed("simulate", profile),
+            elapsed("simulate_completion", profile),
+            elapsed("temporary_locations", profile),
+            elapsed("backpropagate", profile),
+            elapsed("beam_select", profile),
+            elapsed("best_extract", profile),
             skip_elapsed,
             commit_elapsed,
         )

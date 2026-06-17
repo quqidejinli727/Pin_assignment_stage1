@@ -34,6 +34,7 @@ _STAGE1_MODULES = [
     "scoring",
     "segment",
     "segment_subdivision",
+    "stage1_logging",
 ]
 for _mod in _STAGE1_MODULES:
     sys.modules.pop(_mod, None)
@@ -66,9 +67,11 @@ def run_mcts(
     from config import DEFAULT_CONFIG
     from export_final_result import write_config_record, write_interface_result
     from scoring import summarize_metrics
+    from stage1_logging import close_stage1_file_logging, configure_stage1_file_logging
 
     output_path = Path(output_dir).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    configure_stage1_file_logging(output_path)
     if time_limit is not None:
         logger.info(
             "Stage 1 time_limit=%.1fs accepted for compatibility; "
@@ -189,3 +192,4 @@ def run_mcts(
         return str(interface_result_path)
     finally:
         solver.close_feedthrough_context()
+        close_stage1_file_logging()

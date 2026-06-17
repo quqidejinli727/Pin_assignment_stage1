@@ -71,7 +71,7 @@ class RunConfig:
     mcts_hybrid_time_limit_seconds: float = 0.0
 
     # Hybrid ultradeep profile settings
-    mcts_hybrid_enable_ultradeep_profile: bool = False
+    mcts_hybrid_enable_ultradeep_profile: bool = True
     mcts_hybrid_ultradeep_depth: int = 100
     mcts_hybrid_max_expanded_depth: int = 64
     mcts_hybrid_ultradeep_beam_width: int = 1
@@ -80,8 +80,8 @@ class RunConfig:
     mcts_hybrid_use_fast_completion_for_ultradeep: bool = True
 
     # Homology settings
-    homology_use_fanout_reuse_for_sorting: bool = True
-    homology_skip_uncovered_groups: bool = False
+    homology_use_fanout_reuse_for_sorting: bool = False
+    homology_skip_uncovered_groups: bool = True
     homology_skip_coverage_threshold: float = 1.0
     homology_group_commit_coverage_threshold: float = 1.0
 

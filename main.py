@@ -12,6 +12,7 @@ from assignment_solver import AssignmentSolver
 from config import DEFAULT_CONFIG, RunConfig
 from export_final_result import write_config_record, write_interface_result
 from scoring import metrics_to_records, summarize_metrics
+from stage1_logging import close_stage1_file_logging, configure_stage1_file_logging
 
 
 def parse_args() -> argparse.Namespace:
@@ -125,6 +126,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
     """Internal helper."""
     if config is None:
         config = config_from_args(parse_args())
+    configure_stage1_file_logging(config.results_root)
     solver = AssignmentSolver(
         block_json_path=str(config.block_json_path),
         pingroup_json_path=str(config.pingroup_json_path),
@@ -225,6 +227,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         return config.assignment_output_path
     finally:
         solver.close_feedthrough_context()
+        close_stage1_file_logging()
 
 
 if __name__ == "__main__":
