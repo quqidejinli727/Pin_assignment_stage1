@@ -168,6 +168,7 @@ class AssignmentSolver:
         self.assignment_progress_index = 0
         self.assignment_log_interval = 100
         self.assignment_progress_pin_count = 0
+        self.assigned_group_count = 0
         self.total_mcts_simulations = 0
         self.assignment_issues: List[Dict[str, object]] = []
 
@@ -184,13 +185,12 @@ class AssignmentSolver:
         """Run assignment while keeping the optional feedthrough context open."""
         while True:
             made_progress = False
-            for seed_group in self.homology.unassigned_groups():
+            unassigned_groups = self.homology.unassigned_groups()
+            for seed_group in unassigned_groups:
                 if seed_group.assigned:
                     continue
                 tree_build_started = time.perf_counter()
-                prior_assigned_group_count = sum(
-                    1 for group in self.homology.pin_groups.values() if group.assigned
-                )
+                prior_assigned_group_count = self.assigned_group_count
                 nets = self.homology.get_related_nets(seed_group)
                 if not nets:
                     made_progress = self._assign_group_greedily(
@@ -213,11 +213,11 @@ class AssignmentSolver:
                     continue
 
                 pin_full_names = {pin.full_name for pin in pins_in}
-                committable_groups = self._committable_groups(related_groups, pin_full_names)
                 skip_started = time.perf_counter()
-                skipped_group_names = self._uncovered_group_names(
+                committable_groups, skipped_group_names = self._classify_groups_by_coverage(
                     related_groups,
                     pin_full_names,
+                    self.homology_group_commit_coverage_threshold,
                     self.homology_skip_coverage_threshold,
                 )
                 if not self.homology_skip_uncovered_groups:
@@ -262,8 +262,7 @@ class AssignmentSolver:
                 self.total_mcts_simulations += getattr(mcts, "last_simulation_count", 0)
                 commit_started = time.perf_counter()
                 committed_count = self._commit_contained_groups(
-                    search_groups,
-                    pins_in,
+                    effective_committable_groups,
                     proposed_assignment,
                 )
                 commit_elapsed = time.perf_counter() - commit_started
@@ -284,7 +283,7 @@ class AssignmentSolver:
                 made_progress = committed_count > 0 or made_progress
                 self.assignment_rounds += 1
 
-            if not self.homology.unassigned_groups() or not made_progress:
+            if self.assigned_group_count >= len(self.homology.pin_groups) or not made_progress:
                 break
 
         self._finalize_unassigned_groups()
@@ -360,13 +359,20 @@ class AssignmentSolver:
 
     def _commit_contained_groups(
         self,
-        related_groups: List[PinHomologyGroup],
-        pins_in: List[Pin],
-        proposed_assignment: Dict[str, str],
+        related_or_contained_groups: List[PinHomologyGroup],
+        pins_or_assignment,
+        proposed_assignment: Dict[str, str] | None = None,
     ) -> int:
         """Commit groups represented by the current pins_in set."""
-        pin_full_names: Set[str] = {pin.full_name for pin in pins_in}
-        contained_groups = self._committable_groups(related_groups, pin_full_names)
+        if proposed_assignment is None:
+            contained_groups = related_or_contained_groups
+            proposed_assignment = pins_or_assignment
+        else:
+            pin_full_names: Set[str] = {pin.full_name for pin in pins_or_assignment}
+            contained_groups = self._committable_groups(
+                related_or_contained_groups,
+                pin_full_names,
+            )
         committed_count = 0
         for group in contained_groups:
             if group.assigned:
@@ -386,6 +392,29 @@ class AssignmentSolver:
             self._commit_group_assignment(group, segment_id)
             committed_count += 1
         return committed_count
+
+    def _classify_groups_by_coverage(
+        self,
+        related_groups: List[PinHomologyGroup],
+        pin_full_names: Set[str],
+        commit_coverage_threshold: float,
+        skip_coverage_threshold: float,
+    ) -> tuple[List[PinHomologyGroup], Set[str]]:
+        """Classify committable and true-skip groups in one coverage pass."""
+        commit_threshold = max(0.0, min(1.0, commit_coverage_threshold))
+        skip_threshold = max(0.0, min(1.0, skip_coverage_threshold))
+        committable: List[PinHomologyGroup] = []
+        skipped: Set[str] = set()
+        for group in related_groups:
+            if not group.pins:
+                continue
+            covered_count = sum(1 for pin in group.pins if pin.full_name in pin_full_names)
+            coverage_ratio = covered_count / len(group.pins)
+            if coverage_ratio >= commit_threshold:
+                committable.append(group)
+            if coverage_ratio < skip_threshold:
+                skipped.add(group.name)
+        return committable, skipped
 
     def _committable_groups(
         self,
@@ -544,6 +573,7 @@ class AssignmentSolver:
 
     def _print_assignment_progress(self, group: PinHomologyGroup) -> None:
         self.assignment_progress_index += 1
+        self.assigned_group_count += 1
         self.assignment_progress_pin_count += len(group.pins)
 
     def _print_mcts_timing_log(

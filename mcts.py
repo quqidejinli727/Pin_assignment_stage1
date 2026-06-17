@@ -116,6 +116,7 @@ class MCTSSolver:
         self.segment_manager = segment_manager
         self.groups = groups
         self.nets = list(nets)
+        self.groups_by_name = {group.name: group for group in self.groups}
         self.skipped_group_names = set(skipped_group_names or [])
         group_skipped_pin_names = {
             pin.full_name
@@ -163,6 +164,7 @@ class MCTSSolver:
         self.candidate_min_count = max(1, candidate_min_count)
         self.candidate_score_tolerance = max(0.0, candidate_score_tolerance)
         self._candidate_score_cache: Dict[Tuple[str, str], float] = {}
+        self._group_related_nets: Dict[str, List[Net]] | None = None
         self.last_search_profile: SearchProfile | None = None
         self.last_search_diagnostics: Dict[str, object] = {}
         self.last_simulation_count = 0
@@ -190,6 +192,24 @@ class MCTSSolver:
             feedthrough_context=feedthrough_context,
             skipped_pin_names=self.skipped_pin_names,
         )
+
+    def _build_group_related_nets(self) -> Dict[str, List[Net]]:
+        """Precompute nets touched by each group for candidate pruning."""
+        pin_to_group = {
+            pin.full_name: group.name
+            for group in self.groups
+            for pin in group.pins
+        }
+        related: Dict[str, List[Net]] = {group.name: [] for group in self.groups}
+        for net in self.nets:
+            touched_group_names = {
+                pin_to_group[pin.full_name]
+                for pin in net.pins
+                if pin.full_name in pin_to_group
+            }
+            for group_name in touched_group_names:
+                related[group_name].append(net)
+        return related
 
     def search(self) -> Dict[str, str]:
         """Internal helper."""
@@ -755,11 +775,10 @@ class MCTSSolver:
                 continue
             temporary_locations[pin.full_name] = instance.midpoint
 
-        related_pin_names = {pin.full_name for pin in group.pins}
         score = 0.0
-        for net in self.nets:
-            if not any(pin.full_name in related_pin_names for pin in net.pins):
-                continue
+        if self._group_related_nets is None:
+            self._group_related_nets = self._build_group_related_nets()
+        for net in self._group_related_nets.get(group.name, []):
             score -= net_hpwl(net, self.placedb, temporary_locations, self.skipped_pin_names)
         score += 1e-6 * segment.remaining_capacity
         self._candidate_score_cache[key] = score
@@ -796,9 +815,11 @@ class MCTSSolver:
     def _temporary_locations(self, assignments: Dict[str, str]) -> Dict[str, Point]:
         """Internal helper."""
         locations = {}
-        for group in self.groups:
-            segment_id = assignments.get(group.name)
-            if segment_id is None or segment_id == SKIP_SEGMENT_ID:
+        for group_name, segment_id in assignments.items():
+            if segment_id == SKIP_SEGMENT_ID:
+                continue
+            group = self.groups_by_name.get(group_name)
+            if group is None:
                 continue
             for pin in group.pins:
                 try:
