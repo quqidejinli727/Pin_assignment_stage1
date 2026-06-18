@@ -106,6 +106,7 @@ def run_mcts(
         segment_length_percentile=config.segment_length_percentile,
         mcts_search_mode=config.mcts_search_mode,
         mcts_enable_search_diagnostics=config.mcts_enable_search_diagnostics,
+        mcts_search_each_pingroup_once=config.mcts_search_each_pingroup_once,
         mcts_basic_dynamic_simulations=config.mcts_basic_dynamic_simulations,
         mcts_basic_space_scale_divisor=config.mcts_basic_space_scale_divisor,
         mcts_basic_max_space_factor=config.mcts_basic_max_space_factor,
