@@ -175,6 +175,7 @@ class AssignmentSolver:
         self.total_mcts_simulations = 0
         self.stage1_start_time = stage1_start_time
         self.first_mcts_search_logged = False
+        self.searched_seed_groups: Set[str] = set()
         self.assignment_issues: List[Dict[str, object]] = []
 
     def solve(self) -> Dict[str, object]:
@@ -193,6 +194,8 @@ class AssignmentSolver:
             unassigned_groups = self.homology.unassigned_groups()
             for seed_group in unassigned_groups:
                 if seed_group.assigned:
+                    continue
+                if seed_group.name in self.searched_seed_groups:
                     continue
                 tree_build_started = time.perf_counter()
                 prior_assigned_group_count = self.assigned_group_count
@@ -243,6 +246,7 @@ class AssignmentSolver:
                 if not search_groups:
                     self.assignment_rounds += 1
                     continue
+                self.searched_seed_groups.add(seed_group.name)
                 tree_build_elapsed = time.perf_counter() - tree_build_started
                 budget = (
                     self.simulations

@@ -727,6 +727,49 @@ def test_low_committable_ratio_still_builds_mcts_tree(tmp_path):
     assert result["summary"]["assigned_pin_count"] == result["summary"]["pin_count"]
 
 
+def test_each_seed_group_is_searched_at_most_once(tmp_path):
+    """A seed group should not start another MCTS tree in later outer rounds."""
+    block_path, pingroup_path = write_low_committable_case(tmp_path)
+    calls = {"mcts": 0, "commit": 0}
+
+    class FakeMCTS:
+        def __init__(self, *args, **kwargs):
+            calls["mcts"] += 1
+            self.last_simulation_count = 0
+            self.timing_profile = {}
+            self.reward_evaluator = type("FakeReward", (), {"timing_profile": {}})()
+
+        def search(self):
+            return {}
+
+    original_mcts = assignment_solver_module.MCTSSolver
+    assignment_solver_module.MCTSSolver = FakeMCTS
+    try:
+        solver = AssignmentSolver(
+            str(block_path),
+            str(pingroup_path),
+            simulations=1,
+            enable_segment_subdivision=False,
+            feedthrough_weight=0.0,
+        )
+
+        def fake_commit(_groups, _assignment):
+            calls["commit"] += 1
+            if calls["commit"] == 2:
+                group = solver.homology.pin_groups["B.p"]
+                segment = solver.segment_manager.candidates_for_module(group.module_name)[0]
+                solver._commit_group_assignment(group, segment.segment_id)
+                return 1
+            return 0
+
+        solver._commit_contained_groups = fake_commit
+        solver.solve()
+    finally:
+        assignment_solver_module.MCTSSolver = original_mcts
+
+    assert calls["mcts"] == len(solver.homology.pin_groups)
+
+
 def test_high_committable_ratio_builds_mcts_tree(tmp_path):
     """High committable/search group ratio should still invoke MCTS and commit groups."""
     block_path, pingroup_path = write_case(tmp_path)
