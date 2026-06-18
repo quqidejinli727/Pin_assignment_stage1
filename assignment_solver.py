@@ -39,6 +39,7 @@ class AssignmentSolver:
         mcts_basic_space_scale_divisor: float = 100_000.0,
         mcts_basic_max_space_factor: float = 8.0,
         mcts_basic_min_simulations: int = 1024,
+        mcts_enable_depth1_greedy: bool = True,
         mcts_basic_depth1_simulations: int = 32,
         mcts_basic_depth2_simulations: int = 512,
         mcts_basic_disable_pruning_depth_limit: int = 2,
@@ -81,6 +82,7 @@ class AssignmentSolver:
         enable_feedthrough: bool = True,
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
+        stage1_start_time: float | None = None,
     ):
         """Initialize data managers and solver parameters."""
         self.placedb = PlaceDB(block_json_path, pingroup_json_path)
@@ -130,6 +132,7 @@ class AssignmentSolver:
             "basic_space_scale_divisor": mcts_basic_space_scale_divisor,
             "basic_max_space_factor": mcts_basic_max_space_factor,
             "basic_min_simulations": mcts_basic_min_simulations,
+            "enable_depth1_greedy": mcts_enable_depth1_greedy,
             "basic_depth1_simulations": mcts_basic_depth1_simulations,
             "basic_depth2_simulations": mcts_basic_depth2_simulations,
             "basic_disable_pruning_depth_limit": mcts_basic_disable_pruning_depth_limit,
@@ -170,6 +173,8 @@ class AssignmentSolver:
         self.assignment_progress_pin_count = 0
         self.assigned_group_count = 0
         self.total_mcts_simulations = 0
+        self.stage1_start_time = stage1_start_time
+        self.first_mcts_search_logged = False
         self.assignment_issues: List[Dict[str, object]] = []
 
     def solve(self) -> Dict[str, object]:
@@ -257,6 +262,11 @@ class AssignmentSolver:
                     **self.mcts_options,
                 )
                 search_started = time.perf_counter()
+                if not self.first_mcts_search_logged and self.stage1_start_time is not None:
+                    pre_first_mcts_elapsed = search_started - self.stage1_start_time
+                    self.first_mcts_search_logged = True
+                else:
+                    pre_first_mcts_elapsed = 0.0
                 proposed_assignment = mcts.search()
                 search_elapsed = time.perf_counter() - search_started
                 self.total_mcts_simulations += getattr(mcts, "last_simulation_count", 0)
@@ -273,6 +283,7 @@ class AssignmentSolver:
                     search_elapsed=search_elapsed,
                     commit_elapsed=commit_elapsed,
                     tree_build_elapsed=tree_build_elapsed,
+                    pre_first_mcts_elapsed=pre_first_mcts_elapsed,
                     related_group_count=len(related_groups),
                     search_group_count=len(search_groups),
                     committable_group_count=len(effective_committable_groups),
@@ -584,6 +595,7 @@ class AssignmentSolver:
         search_elapsed: float,
         commit_elapsed: float,
         tree_build_elapsed: float,
+        pre_first_mcts_elapsed: float,
         related_group_count: int,
         search_group_count: int,
         committable_group_count: int,
@@ -604,7 +616,7 @@ class AssignmentSolver:
 
         logger.info(
             "mcts_tree round=%d time=%s seed_group=%s "
-            "tree_build_s=%.6f search_wall_s=%.6f "
+            "pre_first_mcts_s=%.6f tree_build_s=%.6f search_wall_s=%.6f "
             "related_groups=%d search_groups=%d committable_groups=%d "
             "skipped_groups=%d prior_assigned_groups=%d committed_groups=%d "
             "simulations=%d mcts_main_s=%.6f reward_total_s=%.6f "
@@ -617,6 +629,7 @@ class AssignmentSolver:
             self.assignment_rounds,
             datetime.now().isoformat(timespec="seconds"),
             seed_group.name,
+            pre_first_mcts_elapsed,
             tree_build_elapsed,
             search_elapsed,
             related_group_count,

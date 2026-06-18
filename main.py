@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -124,6 +125,7 @@ def write_run_report(
 
 def run_pipline(config: RunConfig | None = None) -> Path:
     """Internal helper."""
+    stage1_start_time = time.perf_counter()
     if config is None:
         config = config_from_args(parse_args())
     configure_stage1_file_logging(config.results_root)
@@ -141,6 +143,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         mcts_basic_space_scale_divisor=config.mcts_basic_space_scale_divisor,
         mcts_basic_max_space_factor=config.mcts_basic_max_space_factor,
         mcts_basic_min_simulations=config.mcts_basic_min_simulations,
+        mcts_enable_depth1_greedy=config.mcts_enable_depth1_greedy,
         mcts_basic_depth1_simulations=config.mcts_basic_depth1_simulations,
         mcts_basic_depth2_simulations=config.mcts_basic_depth2_simulations,
         mcts_basic_disable_pruning_depth_limit=config.mcts_basic_disable_pruning_depth_limit,
@@ -184,6 +187,7 @@ def run_pipline(config: RunConfig | None = None) -> Path:
         enable_feedthrough=config.enable_feedthrough,
         auto_build_feedthrough=config.auto_build_feedthrough,
         cmake_generator=config.cmake_generator,
+        stage1_start_time=stage1_start_time,
     )
     try:
         assignment_result = solver.solve()

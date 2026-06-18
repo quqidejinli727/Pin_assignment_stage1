@@ -1030,6 +1030,35 @@ def test_basic_depth1_search_uses_reward_greedy_without_simulation(tmp_path):
     assert fake_evaluator.calls == len(candidates)
 
 
+def test_basic_depth1_greedy_can_be_disabled(tmp_path):
+    """Depth-1 reward-greedy traversal can be disabled by config."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group = homology.pin_groups["A.p"]
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group],
+        placedb.nets_list,
+        simulations=5,
+        search_mode="basic",
+        enable_depth1_greedy=False,
+        basic_depth1_simulations=5,
+    )
+    calls = {"simulate": 0}
+
+    def fake_simulate(_node):
+        calls["simulate"] += 1
+        return 1.0
+
+    mcts._simulate = fake_simulate
+    mcts.search()
+
+    assert calls["simulate"] == 5
+
+
 def test_basic_mcts_search_loop_uses_dynamic_budget(tmp_path):
     """Basic search should run exactly the dynamic budget number of simulations."""
     block_path, pingroup_path = write_case(tmp_path)

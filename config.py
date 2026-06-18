@@ -51,6 +51,7 @@ class RunConfig:
     mcts_basic_space_scale_divisor: float = 100_000.0
     mcts_basic_max_space_factor: float = 8.0
     mcts_basic_min_simulations: int = 1024
+    mcts_enable_depth1_greedy: bool = True
     mcts_basic_depth1_simulations: int = 32
     mcts_basic_depth2_simulations: int = 512
     mcts_basic_disable_pruning_depth_limit: int = 2

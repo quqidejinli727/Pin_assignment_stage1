@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -63,6 +64,7 @@ def run_mcts(
     Returns:
         Path to the generated ``segment_assignments_*.json`` file.
     """
+    stage1_start_time = time.perf_counter()
     from assignment_solver import AssignmentSolver
     from config import DEFAULT_CONFIG
     from export_final_result import write_config_record, write_interface_result
@@ -108,6 +110,7 @@ def run_mcts(
         mcts_basic_space_scale_divisor=config.mcts_basic_space_scale_divisor,
         mcts_basic_max_space_factor=config.mcts_basic_max_space_factor,
         mcts_basic_min_simulations=config.mcts_basic_min_simulations,
+        mcts_enable_depth1_greedy=config.mcts_enable_depth1_greedy,
         mcts_basic_depth1_simulations=config.mcts_basic_depth1_simulations,
         mcts_basic_depth2_simulations=config.mcts_basic_depth2_simulations,
         mcts_basic_disable_pruning_depth_limit=config.mcts_basic_disable_pruning_depth_limit,
@@ -151,6 +154,7 @@ def run_mcts(
         enable_feedthrough=config.enable_feedthrough,
         auto_build_feedthrough=config.auto_build_feedthrough,
         cmake_generator=config.cmake_generator if os.name == "nt" else None,
+        stage1_start_time=stage1_start_time,
     )
     try:
         assignment_result = solver.solve()

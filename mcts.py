@@ -74,6 +74,7 @@ class MCTSSolver:
         basic_space_scale_divisor: float = 1_000_000.0,
         basic_max_space_factor: float = 10.0,
         basic_min_simulations: int = 256,
+        enable_depth1_greedy: bool = True,
         basic_depth1_simulations: int = 32,
         basic_depth2_simulations: int = 256,
         basic_disable_pruning_depth_limit: int = 1,
@@ -134,6 +135,7 @@ class MCTSSolver:
         self.basic_space_scale_divisor = basic_space_scale_divisor
         self.basic_max_space_factor = basic_max_space_factor
         self.basic_min_simulations = basic_min_simulations
+        self.enable_depth1_greedy = enable_depth1_greedy
         self.basic_depth1_simulations = basic_depth1_simulations
         self.basic_depth2_simulations = basic_depth2_simulations
         self.basic_disable_pruning_depth_limit = basic_disable_pruning_depth_limit
@@ -254,7 +256,7 @@ class MCTSSolver:
         profile = self._search_profile(root.usage)
         self.last_search_profile = profile
         self._active_basic_depth = profile.depth
-        if profile.depth == 1 and not self.skipped_group_names:
+        if self.enable_depth1_greedy and profile.depth == 1 and not self.skipped_group_names:
             return self._search_depth1_greedy(root)
 
         for _ in range(self._basic_simulation_budget(root.usage, profile)):
