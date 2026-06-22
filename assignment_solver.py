@@ -35,6 +35,7 @@ class AssignmentSolver:
         segment_length_percentile: int = 50,
         mcts_search_mode: str = "hybrid",
         mcts_enable_search_diagnostics: bool = False,
+        mcts_search_each_pingroup_once: bool = False,
         mcts_basic_dynamic_simulations: bool = True,
         mcts_basic_space_scale_divisor: float = 100_000.0,
         mcts_basic_max_space_factor: float = 8.0,
@@ -125,6 +126,7 @@ class AssignmentSolver:
         self.homology_skip_uncovered_groups = homology_skip_uncovered_groups
         self.homology_skip_coverage_threshold = homology_skip_coverage_threshold
         self.homology_group_commit_coverage_threshold = homology_group_commit_coverage_threshold
+        self.mcts_search_each_pingroup_once = mcts_search_each_pingroup_once
         self.mcts_options = {
             "search_mode": mcts_search_mode,
             "enable_search_diagnostics": mcts_enable_search_diagnostics,
@@ -175,6 +177,7 @@ class AssignmentSolver:
         self.total_mcts_simulations = 0
         self.stage1_start_time = stage1_start_time
         self.first_mcts_search_logged = False
+        self.searched_pingroup_names: Set[str] = set()
         self.assignment_issues: List[Dict[str, object]] = []
 
     def solve(self) -> Dict[str, object]:
@@ -194,6 +197,11 @@ class AssignmentSolver:
             for seed_group in unassigned_groups:
                 if seed_group.assigned:
                     continue
+                if (
+                    self.mcts_search_each_pingroup_once
+                    and seed_group.name in self.searched_pingroup_names
+                ):
+                    continue
                 tree_build_started = time.perf_counter()
                 prior_assigned_group_count = self.assigned_group_count
                 nets = self.homology.get_related_nets(seed_group)
@@ -209,6 +217,10 @@ class AssignmentSolver:
                     group
                     for group in self.homology.groups_for_pins(pins_in)
                     if not group.assigned
+                    and (
+                        not self.mcts_search_each_pingroup_once
+                        or group.name not in self.searched_pingroup_names
+                    )
                 ]
                 if not related_groups:
                     made_progress = self._assign_group_greedily(
@@ -243,6 +255,8 @@ class AssignmentSolver:
                 if not search_groups:
                     self.assignment_rounds += 1
                     continue
+                if self.mcts_search_each_pingroup_once:
+                    self.searched_pingroup_names.update(group.name for group in search_groups)
                 tree_build_elapsed = time.perf_counter() - tree_build_started
                 budget = (
                     self.simulations
@@ -605,6 +619,7 @@ class AssignmentSolver:
     ) -> None:
         profile = getattr(mcts, "timing_profile", {})
         reward_profile = getattr(getattr(mcts, "reward_evaluator", None), "timing_profile", {})
+        child_counts = getattr(mcts, "child_generation_counts", {})
 
         def elapsed(key: str, source: Dict[str, float]) -> float:
             return source.get(key, 0.0)
@@ -622,9 +637,13 @@ class AssignmentSolver:
             "simulations=%d mcts_main_s=%.6f reward_total_s=%.6f "
             "reward_hpwl_s=%.6f reward_ft_s=%.6f "
             "select_s=%.6f expand_s=%.6f child_generation_s=%.6f "
+            "child_actions_s=%.6f child_feasible_s=%.6f child_pruning_s=%.6f "
+            "child_create_s=%.6f child_usage_clone_s=%.6f child_assignment_copy_s=%.6f "
             "simulate_s=%.6f simulate_completion_s=%.6f "
             "temporary_locations_s=%.6f backpropagate_s=%.6f "
             "beam_select_s=%.6f best_extract_s=%.6f "
+            "child_beam_nodes=%d child_action_requests=%d child_actions=%d "
+            "children_created=%d child_pruning_cache_hits=%d child_pruning_cache_misses=%d "
             "true_skip_check_s=%.6f commit_s=%.6f",
             self.assignment_rounds,
             datetime.now().isoformat(timespec="seconds"),
@@ -646,12 +665,24 @@ class AssignmentSolver:
             elapsed("select", profile),
             elapsed("expand", profile),
             elapsed("child_generation", profile),
+            elapsed("child_actions", profile),
+            elapsed("child_feasible", profile),
+            elapsed("child_pruning", profile),
+            elapsed("child_create", profile),
+            elapsed("child_usage_clone", profile),
+            elapsed("child_assignment_copy", profile),
             elapsed("simulate", profile),
             elapsed("simulate_completion", profile),
             elapsed("temporary_locations", profile),
             elapsed("backpropagate", profile),
             elapsed("beam_select", profile),
             elapsed("best_extract", profile),
+            child_counts.get("beam_nodes", 0),
+            child_counts.get("action_requests", 0),
+            child_counts.get("actions", 0),
+            child_counts.get("children_created", 0),
+            child_counts.get("candidate_pruning_order_cache_hits", 0),
+            child_counts.get("candidate_pruning_order_cache_misses", 0),
             skip_elapsed,
             commit_elapsed,
         )

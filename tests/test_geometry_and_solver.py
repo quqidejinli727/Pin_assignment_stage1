@@ -1296,6 +1296,88 @@ def test_candidate_pruning_is_safe_and_disableable(tmp_path):
     assert len(all_candidates) == 4
 
 
+def test_candidate_pruning_cached_order_keeps_original_result(tmp_path):
+    """Static pruning-order caching must preserve the prior feasible ranking."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group = homology.pin_groups["A.p"]
+    usage = segments.snapshot_usage()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group],
+        placedb.nets_list,
+        candidate_min_count=2,
+        candidate_top_k=2,
+        candidate_score_tolerance=0.0,
+    )
+
+    feasible = mcts._raw_feasible_segments(group, usage)
+    expected = sorted(
+        ((mcts._candidate_pruning_score(group, segment), segment) for segment in feasible),
+        key=lambda item: (item[0], item[1].remaining_capacity, item[1].segment_id),
+        reverse=True,
+    )
+    expected_ids = [segment.segment_id for _, segment in expected[:2]]
+    actual_ids = [segment.segment_id for segment in mcts._candidate_segments(group, usage)]
+
+    assert actual_ids == expected_ids
+    assert group.name in mcts._candidate_pruning_order_cache
+
+
+def test_segment_usage_snapshot_clone_only_copies_tree_overrides(tmp_path):
+    """MCTS usage clones retain the global snapshot without copying every segment."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    group = HomologyManager(placedb).pin_groups["A.p"]
+    segment = segments.candidates_for_module(group.module_name)[0]
+    root_usage = segments.snapshot_usage()
+    child_usage = root_usage.clone()
+
+    assert root_usage.used_width == {}
+    assert child_usage.used_width == {}
+    child_usage.assign(segment, group.max_pin_width)
+
+    assert root_usage.width_for(segment) == segment.used_width
+    assert child_usage.width_for(segment) == segment.used_width + group.max_pin_width
+    assert root_usage.can_assign(segment, group.max_pin_width)
+
+
+def test_child_generation_profile_records_nested_breakdown(tmp_path):
+    """Hybrid child generation should expose detailed timing and work counters."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    groups = HomologyManager(placedb).unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=3,
+        search_mode="hybrid",
+        hybrid_basic_depth_limit=0,
+        hybrid_min_layer_simulations=1,
+        hybrid_max_layer_simulations=1,
+        hybrid_max_tree_simulations=3,
+        hybrid_enable_layer_early_stop=False,
+        candidate_min_count=2,
+    )
+    mcts._simulate = lambda _node: 1.0
+
+    mcts.search()
+
+    assert mcts.child_generation_counts["action_requests"] > 0
+    assert mcts.child_generation_counts["children_created"] > 0
+    assert mcts.timing_profile["child_generation"] >= 0.0
+    assert mcts.timing_profile["child_actions"] >= 0.0
+    assert mcts.timing_profile["child_feasible"] >= 0.0
+    assert mcts.timing_profile["child_create"] >= 0.0
+
+
 def test_assignment_greedy_selects_reward_best_feasible_segment(tmp_path):
     """Fallback greedy assignment should prefer reward over remaining capacity."""
     block_path, pingroup_path = write_case(tmp_path)

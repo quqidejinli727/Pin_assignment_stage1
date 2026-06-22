@@ -45,6 +45,7 @@ class RunConfig:
     allow_overflow_fallback: bool = True
     mcts_search_mode: str = "hybrid"
     mcts_enable_search_diagnostics: bool = False
+    mcts_search_each_pingroup_once: bool = False
 
     # Basic mode settings
     mcts_basic_dynamic_simulations: bool = True

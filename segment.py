@@ -55,22 +55,35 @@ class AbstractSegment:
 class SegmentUsage:
     """MCTS 节点中使用的轻量级 segment 占用快照。"""
 
-    def __init__(self, used_width: Dict[str, float] | None = None):
+    def __init__(
+        self,
+        used_width: Dict[str, float] | None = None,
+        base_used_width: Dict[str, float] | None = None,
+    ):
         """初始化一份 segment_id 到已用宽度的映射。"""
         self.used_width = dict(used_width or {})
+        self._base_used_width = base_used_width
 
     def clone(self) -> "SegmentUsage":
         """复制当前占用快照，供 MCTS 子节点独立修改。"""
-        return SegmentUsage(self.used_width)
+        return SegmentUsage(self.used_width, self._base_used_width)
+
+    def width_for(self, segment: AbstractSegment) -> float:
+        """Return this snapshot's effective used width for one segment."""
+        if segment.segment_id in self.used_width:
+            return self.used_width[segment.segment_id]
+        if self._base_used_width is not None:
+            return self._base_used_width.get(segment.segment_id, segment.used_width)
+        return segment.used_width
 
     def can_assign(self, segment: AbstractSegment, width: float) -> bool:
         """在快照状态下判断某 segment 是否可继续分配。"""
-        used = self.used_width.get(segment.segment_id, segment.used_width)
+        used = self.width_for(segment)
         return used + width <= segment.capacity - 1e-9
 
     def assign(self, segment: AbstractSegment, width: float) -> None:
         """在快照状态下记录一次 segment 宽度占用。"""
-        used = self.used_width.get(segment.segment_id, segment.used_width)
+        used = self.width_for(segment)
         self.used_width[segment.segment_id] = used + width
 
 
@@ -222,7 +235,7 @@ class SegmentManager:
     def snapshot_usage(self) -> SegmentUsage:
         """生成当前全局 segment 使用量快照，供 MCTS 搜索使用。"""
         return SegmentUsage(
-            {
+            base_used_width={
                 segment_id: segment.used_width
                 for segment_id, segment in self.abstract_segments.items()
             }

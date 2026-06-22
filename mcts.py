@@ -166,6 +166,9 @@ class MCTSSolver:
         self.candidate_min_count = max(1, candidate_min_count)
         self.candidate_score_tolerance = max(0.0, candidate_score_tolerance)
         self._candidate_score_cache: Dict[Tuple[str, str], float] = {}
+        self._candidate_pruning_order_cache: Dict[
+            str, Tuple[Tuple[float, AbstractSegment], ...]
+        ] = {}
         self._group_related_nets: Dict[str, List[Net]] | None = None
         self.last_search_profile: SearchProfile | None = None
         self.last_search_diagnostics: Dict[str, object] = {}
@@ -180,8 +183,22 @@ class MCTSSolver:
             "reward": 0.0,
             "backpropagate": 0.0,
             "child_generation": 0.0,
+            "child_actions": 0.0,
+            "child_feasible": 0.0,
+            "child_pruning": 0.0,
+            "child_create": 0.0,
+            "child_usage_clone": 0.0,
+            "child_assignment_copy": 0.0,
             "beam_select": 0.0,
             "best_extract": 0.0,
+        }
+        self.child_generation_counts: Dict[str, int] = {
+            "beam_nodes": 0,
+            "action_requests": 0,
+            "actions": 0,
+            "children_created": 0,
+            "candidate_pruning_order_cache_hits": 0,
+            "candidate_pruning_order_cache_misses": 0,
         }
         self.reward_evaluator = RewardEvaluator(
             self.nets,
@@ -218,6 +235,8 @@ class MCTSSolver:
         self.last_simulation_count = 0
         for key in self.timing_profile:
             self.timing_profile[key] = 0.0
+        for key in self.child_generation_counts:
+            self.child_generation_counts[key] = 0
         started = time.perf_counter()
         try:
             if self.groups and not any(
@@ -352,14 +371,26 @@ class MCTSSolver:
             children: List[MCTSNode] = []
             started = time.perf_counter()
             for node in beam:
+                self.child_generation_counts["beam_nodes"] += 1
                 if node.group_index >= len(self.groups):
                     children.append(node)
                     continue
-                actions = self._actions_for_node(node, tail_profile=tail_profile or ultradeep_layer)
+                action_started = time.perf_counter()
+                actions = self._actions_for_node(
+                    node,
+                    tail_profile=tail_profile or ultradeep_layer,
+                    profile_child_generation=True,
+                )
+                self.timing_profile["child_actions"] += time.perf_counter() - action_started
+                self.child_generation_counts["action_requests"] += 1
+                self.child_generation_counts["actions"] += len(actions)
                 if not actions:
                     continue
                 for action in actions:
-                    children.append(self._create_child(node, action))
+                    create_started = time.perf_counter()
+                    children.append(self._create_child(node, action, profile_child_generation=True))
+                    self.timing_profile["child_create"] += time.perf_counter() - create_started
+                    self.child_generation_counts["children_created"] += 1
             self.timing_profile["child_generation"] += time.perf_counter() - started
 
             if not children:
@@ -630,15 +661,26 @@ class MCTSSolver:
         node.untried_actions = []
         return node.children
 
-    def _create_child(self, node: MCTSNode, action: Action) -> MCTSNode:
+    def _create_child(
+        self,
+        node: MCTSNode,
+        action: Action,
+        profile_child_generation: bool = False,
+    ) -> MCTSNode:
         """Internal helper."""
         group_name, segment_id = action
         group = self.groups[node.group_index]
+        started = time.perf_counter()
         usage = node.usage.clone()
+        if profile_child_generation:
+            self.timing_profile["child_usage_clone"] += time.perf_counter() - started
         if segment_id != SKIP_SEGMENT_ID:
             segment = self.segment_manager.abstract_segments[segment_id]
             usage.assign(segment, group.max_pin_width)
+        started = time.perf_counter()
         assignments = dict(node.assignments)
+        if profile_child_generation:
+            self.timing_profile["child_assignment_copy"] += time.perf_counter() - started
         assignments[group_name] = segment_id
 
         child = MCTSNode(
@@ -703,54 +745,106 @@ class MCTSSolver:
         self,
         node: MCTSNode,
         tail_profile: bool = False,
+        profile_child_generation: bool = False,
     ) -> List[Action]:
         """Return capacity-feasible actions, optionally candidate-pruned."""
         group = self.groups[node.group_index]
         if self._is_skipped_group(group):
             return [(group.name, SKIP_SEGMENT_ID)]
-        segments = self._candidate_segments(group, node.usage, tail_profile=tail_profile)
+        segments = self._candidate_segments(
+            group,
+            node.usage,
+            tail_profile=tail_profile,
+            profile_child_generation=profile_child_generation,
+        )
         return [(group.name, segment.segment_id) for segment in segments]
 
     def _raw_feasible_segments(
         self,
         group: PinHomologyGroup,
         usage: SegmentUsage,
+        profile_child_generation: bool = False,
     ) -> List[AbstractSegment]:
         """Return all capacity-feasible segments for one group."""
-        return [
+        started = time.perf_counter()
+        feasible = [
             segment
             for segment in self.segment_manager.candidates_for_module(group.module_name)
             if usage.can_assign(segment, group.max_pin_width)
         ]
+        if profile_child_generation:
+            self.timing_profile["child_feasible"] += time.perf_counter() - started
+        return feasible
 
     def _candidate_segments(
         self,
         group: PinHomologyGroup,
         usage: SegmentUsage,
         tail_profile: bool = False,
+        profile_child_generation: bool = False,
     ) -> List[AbstractSegment]:
         """Return feasible segments after optional conservative pruning."""
-        feasible = self._raw_feasible_segments(group, usage)
+        feasible = self._raw_feasible_segments(
+            group,
+            usage,
+            profile_child_generation=profile_child_generation,
+        )
         if not self.enable_candidate_pruning or self._basic_pruning_disabled():
             return feasible
         if len(feasible) < self.candidate_min_count:
             return feasible
 
+        started = time.perf_counter()
         top_k = self.candidate_tail_top_k if tail_profile else self.candidate_top_k
         top_k = min(max(1, top_k), len(feasible))
-        scored = sorted(
-            ((self._candidate_pruning_score(group, segment), segment) for segment in feasible),
-            key=lambda item: (item[0], item[1].remaining_capacity, item[1].segment_id),
-            reverse=True,
+        scored = self._candidate_pruning_order(
+            group,
+            profile_child_generation=profile_child_generation,
         )
-        best_score = scored[0][0]
+        feasible_ids = {segment.segment_id for segment in feasible}
+        feasible_scored = [
+            item for item in scored if item[1].segment_id in feasible_ids
+        ]
+        if profile_child_generation:
+            self.timing_profile["child_pruning"] += time.perf_counter() - started
+        if not feasible_scored:
+            return feasible
+        best_score = feasible_scored[0][0]
         tolerance = abs(best_score) * self.candidate_score_tolerance
         kept = [
             segment
-            for index, (score, segment) in enumerate(scored)
+            for index, (score, segment) in enumerate(feasible_scored)
             if index < top_k or score >= best_score - tolerance
         ]
         return kept or feasible
+
+    def _candidate_pruning_order(
+        self,
+        group: PinHomologyGroup,
+        profile_child_generation: bool = False,
+    ) -> Tuple[Tuple[float, AbstractSegment], ...]:
+        """Return the static pruning order for all candidates of one group."""
+        cached = self._candidate_pruning_order_cache.get(group.name)
+        if cached is not None:
+            if profile_child_generation:
+                self.child_generation_counts["candidate_pruning_order_cache_hits"] += 1
+            return cached
+
+        if profile_child_generation:
+            self.child_generation_counts["candidate_pruning_order_cache_misses"] += 1
+        ordered = tuple(
+            sorted(
+                (
+                    (self._candidate_pruning_score(group, segment), segment)
+                    for segment in self.segment_manager.candidates_for_module(group.module_name)
+                    if segment.can_fit(group.max_pin_width)
+                ),
+                key=lambda item: (item[0], item[1].remaining_capacity, item[1].segment_id),
+                reverse=True,
+            )
+        )
+        self._candidate_pruning_order_cache[group.name] = ordered
+        return ordered
 
     def _basic_pruning_disabled(self) -> bool:
         """Return whether the active basic/basic-like tree should bypass pruning."""
