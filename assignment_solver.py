@@ -36,6 +36,8 @@ class AssignmentSolver:
         mcts_search_mode: str = "hybrid",
         mcts_enable_search_diagnostics: bool = False,
         mcts_search_each_pingroup_once: bool = False,
+        mcts_enable_inplace_simulation_state: bool = True,
+        mcts_enable_assignment_location_cache: bool = True,
         mcts_basic_dynamic_simulations: bool = True,
         mcts_basic_space_scale_divisor: float = 100_000.0,
         mcts_basic_max_space_factor: float = 8.0,
@@ -130,6 +132,8 @@ class AssignmentSolver:
         self.mcts_options = {
             "search_mode": mcts_search_mode,
             "enable_search_diagnostics": mcts_enable_search_diagnostics,
+            "enable_inplace_simulation_state": mcts_enable_inplace_simulation_state,
+            "enable_assignment_location_cache": mcts_enable_assignment_location_cache,
             "basic_dynamic_simulations": mcts_basic_dynamic_simulations,
             "basic_space_scale_divisor": mcts_basic_space_scale_divisor,
             "basic_max_space_factor": mcts_basic_max_space_factor,
@@ -621,6 +625,7 @@ class AssignmentSolver:
         reward_profile = getattr(getattr(mcts, "reward_evaluator", None), "timing_profile", {})
         child_counts = getattr(mcts, "child_generation_counts", {})
         hpwl_profile = getattr(getattr(mcts, "reward_evaluator", None), "hpwl_profile", {})
+        simulation_counts = getattr(mcts, "simulation_counts", {})
 
         def elapsed(key: str, source: Dict[str, float]) -> float:
             return source.get(key, 0.0)
@@ -641,12 +646,16 @@ class AssignmentSolver:
             "child_actions_s=%.6f child_feasible_s=%.6f child_pruning_s=%.6f "
             "child_create_s=%.6f child_usage_clone_s=%.6f child_assignment_copy_s=%.6f "
             "simulate_s=%.6f simulate_completion_s=%.6f "
-            "temporary_locations_s=%.6f backpropagate_s=%.6f "
+            "simulate_state_rollback_s=%.6f temporary_locations_s=%.6f "
+            "temporary_location_cache_build_s=%.6f backpropagate_s=%.6f "
             "beam_select_s=%.6f best_extract_s=%.6f "
             "child_beam_nodes=%d child_action_requests=%d child_actions=%d "
             "children_created=%d child_pruning_cache_hits=%d child_pruning_cache_misses=%d "
             "hpwl_candidate_calls=%d hpwl_candidate_pin_visits=%d "
             "hpwl_temporary_location_hits=%d hpwl_base_location_hits=%d "
+            "simulation_inplace_rollbacks=%d simulation_usage_entries_restored=%d "
+            "simulation_assignment_entries_restored=%d location_cache_hits=%d "
+            "location_cache_misses=%d "
             "true_skip_check_s=%.6f commit_s=%.6f",
             self.assignment_rounds,
             datetime.now().isoformat(timespec="seconds"),
@@ -677,7 +686,9 @@ class AssignmentSolver:
             elapsed("child_assignment_copy", profile),
             elapsed("simulate", profile),
             elapsed("simulate_completion", profile),
+            elapsed("simulate_state_rollback", profile),
             elapsed("temporary_locations", profile),
+            elapsed("temporary_location_cache_build", profile),
             elapsed("backpropagate", profile),
             elapsed("beam_select", profile),
             elapsed("best_extract", profile),
@@ -691,6 +702,11 @@ class AssignmentSolver:
             hpwl_profile.get("candidate_pin_visits", 0),
             hpwl_profile.get("temporary_location_hits", 0),
             hpwl_profile.get("base_location_hits", 0),
+            simulation_counts.get("inplace_rollbacks", 0),
+            simulation_counts.get("usage_entries_restored", 0),
+            simulation_counts.get("assignment_entries_restored", 0),
+            simulation_counts.get("location_cache_hits", 0),
+            simulation_counts.get("location_cache_misses", 0),
             skip_elapsed,
             commit_elapsed,
         )

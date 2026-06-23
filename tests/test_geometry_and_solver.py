@@ -1378,6 +1378,73 @@ def test_child_generation_profile_records_nested_breakdown(tmp_path):
     assert mcts.timing_profile["child_create"] >= 0.0
 
 
+def test_inplace_simulation_matches_clone_mode_and_restores_node(tmp_path):
+    """In-place rollouts must match clone rollouts without leaking node state."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    groups = HomologyManager(placedb).unassigned_groups()
+    common = dict(
+        simulations=1,
+        random_seed=19,
+        enable_feedthrough=False,
+        feedthrough_weight=0.0,
+    )
+    inplace = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        enable_inplace_simulation_state=True,
+        **common,
+    )
+    clone = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        enable_inplace_simulation_state=False,
+        **common,
+    )
+    inplace_node = MCTSNode(0, segments.snapshot_usage(), {})
+    clone_node = MCTSNode(0, segments.snapshot_usage(), {})
+
+    inplace_reward = inplace._simulate(inplace_node)
+    clone_reward = clone._simulate(clone_node)
+
+    assert inplace_reward == clone_reward
+    assert inplace_node.assignments == {}
+    assert inplace_node.usage.used_width == {}
+    assert inplace.simulation_counts["inplace_rollbacks"] == 1
+    assert inplace.simulation_counts["usage_entries_restored"] > 0
+    assert clone.simulation_counts["inplace_rollbacks"] == 0
+
+
+def test_assignment_location_cache_reuses_group_segment_midpoints(tmp_path):
+    """Repeated temporary-location construction should reuse midpoint pairs."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    group = HomologyManager(placedb).pin_groups["A.p"]
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group],
+        placedb.nets_list,
+        enable_assignment_location_cache=True,
+        enable_feedthrough=False,
+        feedthrough_weight=0.0,
+    )
+    assignments = {group.name: "A:S0"}
+
+    first = mcts._temporary_locations(assignments)
+    second = mcts._temporary_locations(assignments)
+
+    assert first == second
+    assert mcts.simulation_counts["location_cache_misses"] == 1
+    assert mcts.simulation_counts["location_cache_hits"] == 1
+
+
 def test_assignment_greedy_selects_reward_best_feasible_segment(tmp_path):
     """Fallback greedy assignment should prefer reward over remaining capacity."""
     block_path, pingroup_path = write_case(tmp_path)

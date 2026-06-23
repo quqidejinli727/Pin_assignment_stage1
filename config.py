@@ -46,6 +46,8 @@ class RunConfig:
     mcts_search_mode: str = "hybrid"
     mcts_enable_search_diagnostics: bool = False
     mcts_search_each_pingroup_once: bool = False
+    mcts_enable_inplace_simulation_state: bool = True
+    mcts_enable_assignment_location_cache: bool = True
 
     # Basic mode settings
     mcts_basic_dynamic_simulations: bool = True

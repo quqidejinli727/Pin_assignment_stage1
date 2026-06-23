@@ -17,6 +17,7 @@ from segment import AbstractSegment, SegmentManager, SegmentUsage
 
 Action = Tuple[str, str]
 SKIP_SEGMENT_ID = "__SKIP_UNCOVERED_GROUP__"
+_MISSING_VALUE = object()
 
 
 @dataclass
@@ -70,6 +71,8 @@ class MCTSSolver:
         random_seed: int = 7,
         search_mode: str = "hybrid",
         enable_search_diagnostics: bool = False,
+        enable_inplace_simulation_state: bool = True,
+        enable_assignment_location_cache: bool = True,
         basic_dynamic_simulations: bool = True,
         basic_space_scale_divisor: float = 1_000_000.0,
         basic_max_space_factor: float = 10.0,
@@ -131,6 +134,8 @@ class MCTSSolver:
         self.random = random.Random(random_seed)
         self.search_mode = search_mode
         self.enable_search_diagnostics = enable_search_diagnostics
+        self.enable_inplace_simulation_state = enable_inplace_simulation_state
+        self.enable_assignment_location_cache = enable_assignment_location_cache
         self.basic_dynamic_simulations = basic_dynamic_simulations
         self.basic_space_scale_divisor = basic_space_scale_divisor
         self.basic_max_space_factor = basic_max_space_factor
@@ -169,6 +174,9 @@ class MCTSSolver:
         self._candidate_pruning_order_cache: Dict[
             str, Tuple[Tuple[float, AbstractSegment], ...]
         ] = {}
+        self._assignment_location_cache: Dict[
+            Tuple[str, str], Tuple[Tuple[str, Point], ...]
+        ] = {}
         self._group_related_nets: Dict[str, List[Net]] | None = None
         self.last_search_profile: SearchProfile | None = None
         self.last_search_diagnostics: Dict[str, object] = {}
@@ -179,7 +187,9 @@ class MCTSSolver:
             "expand": 0.0,
             "simulate": 0.0,
             "simulate_completion": 0.0,
+            "simulate_state_rollback": 0.0,
             "temporary_locations": 0.0,
+            "temporary_location_cache_build": 0.0,
             "reward": 0.0,
             "backpropagate": 0.0,
             "child_generation": 0.0,
@@ -199,6 +209,13 @@ class MCTSSolver:
             "children_created": 0,
             "candidate_pruning_order_cache_hits": 0,
             "candidate_pruning_order_cache_misses": 0,
+        }
+        self.simulation_counts: Dict[str, int] = {
+            "inplace_rollbacks": 0,
+            "usage_entries_restored": 0,
+            "assignment_entries_restored": 0,
+            "location_cache_hits": 0,
+            "location_cache_misses": 0,
         }
         self.reward_evaluator = RewardEvaluator(
             self.nets,
@@ -237,6 +254,8 @@ class MCTSSolver:
             self.timing_profile[key] = 0.0
         for key in self.child_generation_counts:
             self.child_generation_counts[key] = 0
+        for key in self.simulation_counts:
+            self.simulation_counts[key] = 0
         started = time.perf_counter()
         try:
             if self.groups and not any(
@@ -883,6 +902,12 @@ class MCTSSolver:
     def _simulate(self, node: MCTSNode) -> float:
         """Internal helper."""
         self.last_simulation_count += 1
+        if self.enable_inplace_simulation_state:
+            return self._simulate_inplace(node)
+        return self._simulate_with_clones(node)
+
+    def _simulate_with_clones(self, node: MCTSNode) -> float:
+        """Run one rollout with isolated usage and assignment copies."""
         started = time.perf_counter()
         usage = node.usage.clone()
         assignments = dict(node.assignments)
@@ -908,22 +933,127 @@ class MCTSSolver:
         self.timing_profile["reward"] += time.perf_counter() - started
         return reward
 
+    def _simulate_inplace(self, node: MCTSNode) -> float:
+        """Run one rollout by temporarily mutating and restoring the node state."""
+        usage = node.usage
+        assignments = node.assignments
+        usage_overrides = usage.used_width
+        usage_before: Dict[str, object] = {}
+        assignments_before: Dict[str, object] = {}
+        completion_started = time.perf_counter()
+        try:
+            for index in range(node.group_index, len(self.groups)):
+                group = self.groups[index]
+                group_name = group.name
+                if group_name not in assignments_before:
+                    assignments_before[group_name] = assignments.get(
+                        group_name,
+                        _MISSING_VALUE,
+                    )
+                if self._is_skipped_group(group):
+                    assignments[group_name] = SKIP_SEGMENT_ID
+                    continue
+
+                feasible = self._candidate_segments(group, usage)
+                if not feasible:
+                    self.timing_profile["simulate_completion"] += (
+                        time.perf_counter() - completion_started
+                    )
+                    return -1.0e30
+                segment = self.random.choice(feasible)
+                segment_id = segment.segment_id
+                if segment_id not in usage_before:
+                    usage_before[segment_id] = usage_overrides.get(
+                        segment_id,
+                        _MISSING_VALUE,
+                    )
+                usage_overrides[segment_id] = (
+                    usage.width_for(segment) + group.max_pin_width
+                )
+                assignments[group_name] = segment_id
+
+            self.timing_profile["simulate_completion"] += (
+                time.perf_counter() - completion_started
+            )
+            locations_started = time.perf_counter()
+            temporary_locations = self._temporary_locations(assignments)
+            self.timing_profile["temporary_locations"] += (
+                time.perf_counter() - locations_started
+            )
+            reward_started = time.perf_counter()
+            reward = self.reward_evaluator.evaluate(temporary_locations)
+            self.timing_profile["reward"] += time.perf_counter() - reward_started
+            return reward
+        finally:
+            rollback_started = time.perf_counter()
+            for segment_id, previous in usage_before.items():
+                if previous is _MISSING_VALUE:
+                    usage_overrides.pop(segment_id, None)
+                else:
+                    usage_overrides[segment_id] = previous
+            for group_name, previous in assignments_before.items():
+                if previous is _MISSING_VALUE:
+                    assignments.pop(group_name, None)
+                else:
+                    assignments[group_name] = previous
+            self.timing_profile["simulate_state_rollback"] += (
+                time.perf_counter() - rollback_started
+            )
+            self.simulation_counts["inplace_rollbacks"] += 1
+            self.simulation_counts["usage_entries_restored"] += len(usage_before)
+            self.simulation_counts["assignment_entries_restored"] += len(
+                assignments_before
+            )
+
     def _temporary_locations(self, assignments: Dict[str, str]) -> Dict[str, Point]:
         """Internal helper."""
         locations = {}
         for group_name, segment_id in assignments.items():
             if segment_id == SKIP_SEGMENT_ID:
                 continue
-            group = self.groups_by_name.get(group_name)
-            if group is None:
-                continue
-            for pin in group.pins:
-                try:
-                    instance = self.segment_manager.get_instance(pin.parent_inst, segment_id)
-                except KeyError:
-                    continue
-                locations[pin.full_name] = instance.midpoint
+            for pin_name, midpoint in self._group_segment_locations(
+                group_name,
+                segment_id,
+            ):
+                locations[pin_name] = midpoint
         return locations
+
+    def _group_segment_locations(
+        self,
+        group_name: str,
+        segment_id: str,
+    ) -> Tuple[Tuple[str, Point], ...]:
+        """Return cached pin midpoint pairs for one group-to-segment assignment."""
+        key = (group_name, segment_id)
+        if self.enable_assignment_location_cache:
+            cached = self._assignment_location_cache.get(key)
+            if cached is not None:
+                self.simulation_counts["location_cache_hits"] += 1
+                return cached
+
+        started = time.perf_counter()
+        group = self.groups_by_name.get(group_name)
+        pairs: Tuple[Tuple[str, Point], ...]
+        if group is None:
+            pairs = ()
+        else:
+            pairs = tuple(
+                (pin.full_name, instance.midpoint)
+                for pin in group.pins
+                for instance in [
+                    self.segment_manager.instance_lookup.get(
+                        (pin.parent_inst, segment_id)
+                    )
+                ]
+                if instance is not None
+            )
+        self.timing_profile["temporary_location_cache_build"] += (
+            time.perf_counter() - started
+        )
+        if self.enable_assignment_location_cache:
+            self._assignment_location_cache[key] = pairs
+            self.simulation_counts["location_cache_misses"] += 1
+        return pairs
 
     def _backpropagate(self, node: MCTSNode, reward: float) -> None:
         """Internal helper."""
