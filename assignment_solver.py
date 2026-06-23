@@ -621,6 +621,7 @@ class AssignmentSolver:
         reward_profile = getattr(getattr(mcts, "reward_evaluator", None), "timing_profile", {})
         child_counts = getattr(mcts, "child_generation_counts", {})
         hpwl_profile = getattr(getattr(mcts, "reward_evaluator", None), "hpwl_profile", {})
+        simulation_counts = getattr(mcts, "simulation_counts", {})
 
         def elapsed(key: str, source: Dict[str, float]) -> float:
             return source.get(key, 0.0)
@@ -641,12 +642,16 @@ class AssignmentSolver:
             "child_actions_s=%.6f child_feasible_s=%.6f child_pruning_s=%.6f "
             "child_create_s=%.6f child_usage_clone_s=%.6f child_assignment_copy_s=%.6f "
             "simulate_s=%.6f simulate_completion_s=%.6f "
+            "simulate_candidate_segments_s=%.6f simulate_feasible_s=%.6f "
+            "simulate_pruning_s=%.6f simulate_usage_assign_s=%.6f "
             "temporary_locations_s=%.6f backpropagate_s=%.6f "
             "beam_select_s=%.6f best_extract_s=%.6f "
             "child_beam_nodes=%d child_action_requests=%d child_actions=%d "
             "children_created=%d child_pruning_cache_hits=%d child_pruning_cache_misses=%d "
             "hpwl_candidate_calls=%d hpwl_candidate_pin_visits=%d "
             "hpwl_temporary_location_hits=%d hpwl_base_location_hits=%d "
+            "simulation_groups_visited=%d simulation_candidate_requests=%d "
+            "simulation_candidate_results=%d simulation_usage_assignments=%d "
             "true_skip_check_s=%.6f commit_s=%.6f",
             self.assignment_rounds,
             datetime.now().isoformat(timespec="seconds"),
@@ -677,6 +682,10 @@ class AssignmentSolver:
             elapsed("child_assignment_copy", profile),
             elapsed("simulate", profile),
             elapsed("simulate_completion", profile),
+            elapsed("simulate_candidate_segments", profile),
+            elapsed("simulate_feasible", profile),
+            elapsed("simulate_pruning", profile),
+            elapsed("simulate_usage_assign", profile),
             elapsed("temporary_locations", profile),
             elapsed("backpropagate", profile),
             elapsed("beam_select", profile),
@@ -691,6 +700,10 @@ class AssignmentSolver:
             hpwl_profile.get("candidate_pin_visits", 0),
             hpwl_profile.get("temporary_location_hits", 0),
             hpwl_profile.get("base_location_hits", 0),
+            simulation_counts.get("groups_visited", 0),
+            simulation_counts.get("candidate_requests", 0),
+            simulation_counts.get("candidate_results", 0),
+            simulation_counts.get("usage_assignments", 0),
             skip_elapsed,
             commit_elapsed,
         )

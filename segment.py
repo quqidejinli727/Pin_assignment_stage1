@@ -86,6 +86,30 @@ class SegmentUsage:
         used = self.width_for(segment)
         self.used_width[segment.segment_id] = used + width
 
+    def feasible_segments(
+        self,
+        candidates: Iterable[AbstractSegment],
+        width: float,
+    ) -> List[AbstractSegment]:
+        """Return capacity-feasible candidates with a tight local loop."""
+        overrides = self.used_width
+        base = self._base_used_width
+        feasible: List[AbstractSegment] = []
+        if base is None:
+            for segment in candidates:
+                used = overrides.get(segment.segment_id, segment.used_width)
+                if used + width <= segment.capacity - 1e-9:
+                    feasible.append(segment)
+            return feasible
+
+        for segment in candidates:
+            used = overrides.get(segment.segment_id)
+            if used is None:
+                used = base.get(segment.segment_id, segment.used_width)
+            if used + width <= segment.capacity - 1e-9:
+                feasible.append(segment)
+        return feasible
+
 
 class SegmentManager:
     """构建并管理抽象 segment、实例 segment 和容量使用情况。"""

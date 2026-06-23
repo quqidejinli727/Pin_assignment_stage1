@@ -179,6 +179,10 @@ class MCTSSolver:
             "expand": 0.0,
             "simulate": 0.0,
             "simulate_completion": 0.0,
+            "simulate_candidate_segments": 0.0,
+            "simulate_feasible": 0.0,
+            "simulate_pruning": 0.0,
+            "simulate_usage_assign": 0.0,
             "temporary_locations": 0.0,
             "reward": 0.0,
             "backpropagate": 0.0,
@@ -199,6 +203,12 @@ class MCTSSolver:
             "children_created": 0,
             "candidate_pruning_order_cache_hits": 0,
             "candidate_pruning_order_cache_misses": 0,
+        }
+        self.simulation_counts: Dict[str, int] = {
+            "groups_visited": 0,
+            "candidate_requests": 0,
+            "candidate_results": 0,
+            "usage_assignments": 0,
         }
         self.reward_evaluator = RewardEvaluator(
             self.nets,
@@ -237,6 +247,8 @@ class MCTSSolver:
             self.timing_profile[key] = 0.0
         for key in self.child_generation_counts:
             self.child_generation_counts[key] = 0
+        for key in self.simulation_counts:
+            self.simulation_counts[key] = 0
         started = time.perf_counter()
         try:
             if self.groups and not any(
@@ -764,16 +776,18 @@ class MCTSSolver:
         group: PinHomologyGroup,
         usage: SegmentUsage,
         profile_child_generation: bool = False,
+        profile_simulation: bool = False,
     ) -> List[AbstractSegment]:
         """Return all capacity-feasible segments for one group."""
         started = time.perf_counter()
-        feasible = [
-            segment
-            for segment in self.segment_manager.candidates_for_module(group.module_name)
-            if usage.can_assign(segment, group.max_pin_width)
-        ]
+        feasible = usage.feasible_segments(
+            self.segment_manager.candidates_for_module(group.module_name),
+            group.max_pin_width,
+        )
         if profile_child_generation:
             self.timing_profile["child_feasible"] += time.perf_counter() - started
+        if profile_simulation:
+            self.timing_profile["simulate_feasible"] += time.perf_counter() - started
         return feasible
 
     def _candidate_segments(
@@ -782,12 +796,14 @@ class MCTSSolver:
         usage: SegmentUsage,
         tail_profile: bool = False,
         profile_child_generation: bool = False,
+        profile_simulation: bool = False,
     ) -> List[AbstractSegment]:
         """Return feasible segments after optional conservative pruning."""
         feasible = self._raw_feasible_segments(
             group,
             usage,
             profile_child_generation=profile_child_generation,
+            profile_simulation=profile_simulation,
         )
         if not self.enable_candidate_pruning or self._basic_pruning_disabled():
             return feasible
@@ -807,6 +823,8 @@ class MCTSSolver:
         ]
         if profile_child_generation:
             self.timing_profile["child_pruning"] += time.perf_counter() - started
+        if profile_simulation:
+            self.timing_profile["simulate_pruning"] += time.perf_counter() - started
         if not feasible_scored:
             return feasible
         best_score = feasible_scored[0][0]
@@ -888,15 +906,31 @@ class MCTSSolver:
         assignments = dict(node.assignments)
         for index in range(node.group_index, len(self.groups)):
             group = self.groups[index]
+            self.simulation_counts["groups_visited"] += 1
             if self._is_skipped_group(group):
                 assignments[group.name] = SKIP_SEGMENT_ID
                 continue
-            feasible = self._candidate_segments(group, usage)
+            candidates_started = time.perf_counter()
+            feasible = self._candidate_segments(
+                group,
+                usage,
+                profile_simulation=True,
+            )
+            self.timing_profile["simulate_candidate_segments"] += (
+                time.perf_counter() - candidates_started
+            )
+            self.simulation_counts["candidate_requests"] += 1
+            self.simulation_counts["candidate_results"] += len(feasible)
             if not feasible:
                 self.timing_profile["simulate_completion"] += time.perf_counter() - started
                 return -1.0e30
             segment = self.random.choice(feasible)
+            assign_started = time.perf_counter()
             usage.assign(segment, group.max_pin_width)
+            self.timing_profile["simulate_usage_assign"] += (
+                time.perf_counter() - assign_started
+            )
+            self.simulation_counts["usage_assignments"] += 1
             assignments[group.name] = segment.segment_id
         self.timing_profile["simulate_completion"] += time.perf_counter() - started
 

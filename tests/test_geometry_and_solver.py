@@ -462,6 +462,35 @@ def test_mcts_records_actual_simulation_count(tmp_path):
     assert mcts.last_simulation_count == 5
 
 
+def test_simulation_completion_records_candidate_breakdown(tmp_path):
+    """Simulation timing exposes candidate filtering and usage-update work."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    groups = HomologyManager(placedb).unassigned_groups()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        groups,
+        placedb.nets_list,
+        simulations=3,
+        search_mode="basic",
+        basic_dynamic_simulations=False,
+        enable_feedthrough=False,
+        feedthrough_weight=0.0,
+    )
+
+    mcts.search()
+
+    assert mcts.simulation_counts["groups_visited"] > 0
+    assert mcts.simulation_counts["candidate_requests"] > 0
+    assert mcts.simulation_counts["candidate_results"] > 0
+    assert mcts.simulation_counts["usage_assignments"] > 0
+    assert mcts.timing_profile["simulate_candidate_segments"] >= 0.0
+    assert mcts.timing_profile["simulate_feasible"] >= 0.0
+    assert mcts.timing_profile["simulate_usage_assign"] >= 0.0
+
+
 def test_skip_assignment_is_not_committed_or_greedy_fallback(tmp_path):
     """A true-skip MCTS action should not be converted into a real segment assignment."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -1344,6 +1373,28 @@ def test_segment_usage_snapshot_clone_only_copies_tree_overrides(tmp_path):
     assert root_usage.width_for(segment) == segment.used_width
     assert child_usage.width_for(segment) == segment.used_width + group.max_pin_width
     assert root_usage.can_assign(segment, group.max_pin_width)
+
+
+def test_segment_usage_batch_feasible_matches_can_assign(tmp_path):
+    """The optimized batch capacity filter must preserve per-segment results."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    group = HomologyManager(placedb).pin_groups["A.p"]
+    usage = segments.snapshot_usage()
+    candidates = segments.candidates_for_module(group.module_name)
+    usage.assign(candidates[0], group.max_pin_width)
+
+    expected = [
+        segment
+        for segment in candidates
+        if usage.can_assign(segment, group.max_pin_width)
+    ]
+    actual = usage.feasible_segments(candidates, group.max_pin_width)
+
+    assert [segment.segment_id for segment in actual] == [
+        segment.segment_id for segment in expected
+    ]
 
 
 def test_child_generation_profile_records_nested_breakdown(tmp_path):
