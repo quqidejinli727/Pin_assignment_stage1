@@ -92,6 +92,9 @@ def summarize_log(log_path: str | Path) -> Dict[str, Any]:
         "total_commit_s": timing_totals.get("commit_s", 0.0),
         "total_reward_s": timing_totals.get("reward_total_s", 0.0),
         "total_reward_hpwl_s": timing_totals.get("reward_hpwl_s", 0.0),
+        "total_reward_hpwl_reference_s": timing_totals.get(
+            "reward_hpwl_reference_s", 0.0
+        ),
         "total_reward_ft_s": timing_totals.get("reward_ft_s", 0.0),
         "total_mcts_main_s": timing_totals.get("mcts_main_s", 0.0),
         "total_child_generation_s": timing_totals.get("child_generation_s", 0.0),

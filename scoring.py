@@ -17,7 +17,10 @@ from types import ModuleType
 from typing import Callable, Dict, Iterable, List, Set, Tuple
 
 from PlaceDB import Net, PlaceDB
-from geometry_utils import Point, hpwl
+from geometry_utils import Point
+
+
+_MISSING_POINT = object()
 
 
 def feedthrough_reward(_: Iterable[Net]) -> float:
@@ -32,17 +35,31 @@ def net_hpwl(
     skipped_pin_names: Set[str] | None = None,
 ) -> float:
     """Compute one net HPWL, optionally removing truly skipped pins."""
-    skipped_pin_names = skipped_pin_names or set()
-    active_pins = [pin for pin in net.pins if pin.full_name not in skipped_pin_names]
-    if len(active_pins) <= 1:
+    skipped = skipped_pin_names or ()
+    locations_get = temporary_locations.get
+    min_x = min_y = float("inf")
+    max_x = max_y = float("-inf")
+    active_count = 0
+    for pin in net.pins:
+        pin_name = pin.full_name
+        if pin_name in skipped:
+            continue
+        point = locations_get(pin_name, _MISSING_POINT)
+        if point is _MISSING_POINT:
+            point = placedb.get_pin_location_estimate(pin)
+        x, y = point
+        if x < min_x:
+            min_x = x
+        if x > max_x:
+            max_x = x
+        if y < min_y:
+            min_y = y
+        if y > max_y:
+            max_y = y
+        active_count += 1
+    if active_count <= 1:
         return 0.0
-    points = []
-    for pin in active_pins:
-        if pin.full_name in temporary_locations:
-            points.append(temporary_locations[pin.full_name])
-        else:
-            points.append(placedb.get_pin_location_estimate(pin))
-    return hpwl(points)
+    return (max_x - min_x) + (max_y - min_y)
 
 @dataclass
 class NetReferenceMetrics:
@@ -161,7 +178,15 @@ class RewardEvaluator:
         self.reward_scale = reward_scale
         self.feedthrough_context = feedthrough_context
         self.skipped_pin_names = skipped_pin_names or set()
-        self.metric_nets = [net for net in self.nets if self._active_pin_count(net) > 1]
+        self._net_active_pins = {
+            id(net): tuple(
+                pin for pin in net.pins if pin.full_name not in self.skipped_pin_names
+            )
+            for net in self.nets
+        }
+        self.metric_nets = [
+            net for net in self.nets if len(self._net_active_pins[id(net)]) > 1
+        ]
         self.skipped_single_pin_net_count = len(self.nets) - len(self.metric_nets)
         self._pin_estimate_cache: Dict[str, Point] = {}
         self.timing_profile: Dict[str, float] = {
@@ -170,21 +195,24 @@ class RewardEvaluator:
             "reward_feedthrough": 0.0,
             "reward_feedthrough_location": 0.0,
             "reward_feedthrough_eval": 0.0,
+            "reward_hpwl_reference": 0.0,
         }
-        self._net_pins = {id(net): list(net.pins) for net in self.metric_nets}
+        self.hpwl_profile: Dict[str, int] = {
+            "candidate_calls": 0,
+            "candidate_pin_visits": 0,
+            "temporary_location_hits": 0,
+            "base_location_hits": 0,
+            "reference_calls": 0,
+            "reference_pin_visits": 0,
+        }
         self._net_pin_names = {
-            id(net): {
-                pin.full_name
-                for pin in net.pins
-                if pin.full_name not in self.skipped_pin_names
-            }
+            id(net): {pin.full_name for pin in self._net_active_pins[id(net)]}
             for net in self.metric_nets
         }
         self._net_base_locations = {
             id(net): {
                 pin.full_name: self._pin_base_location(pin)
-                for pin in net.pins
-                if pin.full_name not in self.skipped_pin_names
+                for pin in self._net_active_pins[id(net)]
             }
             for net in self.metric_nets
         }
@@ -208,12 +236,7 @@ class RewardEvaluator:
         for net in self.metric_nets:
             reference = self.reference_metrics[id(net)]
             hpwl_started = time.perf_counter()
-            candidate_hpwl = net_hpwl(
-                net,
-                self.placedb,
-                temporary_locations,
-                self.skipped_pin_names,
-            )
+            candidate_hpwl = self._candidate_hpwl(net, temporary_locations)
             self.timing_profile["reward_hpwl"] += time.perf_counter() - hpwl_started
             wirelength_reward = self._normalized_improvement(reference.hpwl, candidate_hpwl)
 
@@ -235,17 +258,20 @@ class RewardEvaluator:
         return total_reward * self.reward_scale
 
     def _build_reference_metrics(self, net: Net) -> NetReferenceMetrics:
+        reference_started = time.perf_counter()
         reference_locations = {
             pin.full_name: self.placedb.get_module(pin.parent_inst).get_centroid()
-            for pin in net.pins
-            if pin.full_name not in self.skipped_pin_names
+            for pin in self._net_active_pins[id(net)]
         }
-        reference_hpwl = net_hpwl(
-            net,
-            self.placedb,
+        reference_hpwl = self._hpwl_from_location_map(
+            self._net_active_pins[id(net)],
             reference_locations,
-            self.skipped_pin_names,
         )
+        self.timing_profile["reward_hpwl_reference"] += (
+            time.perf_counter() - reference_started
+        )
+        self.hpwl_profile["reference_calls"] += 1
+        self.hpwl_profile["reference_pin_visits"] += len(self._net_active_pins[id(net)])
         reference_feedthrough = (
             self._feedthrough_at_locations(
                 net,
@@ -257,6 +283,70 @@ class RewardEvaluator:
             else 0.0
         )
         return NetReferenceMetrics(reference_hpwl, reference_feedthrough)
+
+    @staticmethod
+    def _hpwl_from_location_map(pins, locations: Dict[str, Point]) -> float:
+        """Compute HPWL from a complete cached location map without allocations."""
+        if len(pins) <= 1:
+            return 0.0
+        first_x, first_y = locations[pins[0].full_name]
+        min_x = max_x = first_x
+        min_y = max_y = first_y
+        for pin in pins[1:]:
+            x, y = locations[pin.full_name]
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
+        return (max_x - min_x) + (max_y - min_y)
+
+    def _candidate_hpwl(
+        self,
+        net: Net,
+        temporary_locations: Dict[str, Point],
+    ) -> float:
+        """Compute candidate HPWL from cached base locations in one pass."""
+        net_id = id(net)
+        pins = self._net_active_pins[net_id]
+        base_locations = self._net_base_locations[net_id]
+        locations_get = temporary_locations.get
+        first_pin_name = pins[0].full_name
+        first_point = locations_get(first_pin_name, _MISSING_POINT)
+        temporary_hits = 0
+        if first_point is _MISSING_POINT:
+            first_point = base_locations[first_pin_name]
+            base_hits = 1
+        else:
+            temporary_hits = 1
+            base_hits = 0
+        min_x = max_x = first_point[0]
+        min_y = max_y = first_point[1]
+        for pin in pins[1:]:
+            pin_name = pin.full_name
+            point = locations_get(pin_name, _MISSING_POINT)
+            if point is _MISSING_POINT:
+                point = base_locations[pin_name]
+                base_hits += 1
+            else:
+                temporary_hits += 1
+            x, y = point
+            if x < min_x:
+                min_x = x
+            if x > max_x:
+                max_x = x
+            if y < min_y:
+                min_y = y
+            if y > max_y:
+                max_y = y
+        self.hpwl_profile["candidate_calls"] += 1
+        self.hpwl_profile["candidate_pin_visits"] += len(pins)
+        self.hpwl_profile["temporary_location_hits"] += temporary_hits
+        self.hpwl_profile["base_location_hits"] += base_hits
+        return (max_x - min_x) + (max_y - min_y)
 
     def _candidate_feedthrough(
         self,
@@ -358,9 +448,6 @@ class RewardEvaluator:
             if pin_name in net_pin_names:
                 locations[pin_name] = point
         return locations
-
-    def _active_pin_count(self, net: Net) -> int:
-        return sum(1 for pin in net.pins if pin.full_name not in self.skipped_pin_names)
 
     @staticmethod
     def _rounded_point(point: Point) -> Point:

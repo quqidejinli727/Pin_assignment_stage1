@@ -1445,6 +1445,42 @@ def test_reward_evaluator_normalizes_against_centroid_reference(tmp_path):
     assert scaled_evaluator.evaluate(temporary_locations) == 20.0
 
 
+def test_cached_candidate_hpwl_matches_generic_net_hpwl(tmp_path):
+    """Cached reward HPWL must exactly match the public net_hpwl helper."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    net = placedb.nets_list[0]
+    evaluator = RewardEvaluator(
+        [net],
+        placedb,
+        feedthrough_weight=0.0,
+        enable_feedthrough=False,
+    )
+
+    for locations in ({}, {net.pins[0].full_name: (35.0, 5.0)}, {
+        pin.full_name: (35.0 + index, 5.0)
+        for index, pin in enumerate(net.pins)
+    }):
+        assert evaluator._candidate_hpwl(net, locations) == net_hpwl(
+            net,
+            placedb,
+            locations,
+        )
+
+    skipped = {net.pins[1].full_name}
+    skipped_evaluator = RewardEvaluator(
+        [net],
+        placedb,
+        feedthrough_weight=0.0,
+        enable_feedthrough=False,
+        skipped_pin_names=skipped,
+    )
+    assert skipped_evaluator.metric_nets == []
+    assert net_hpwl(net, placedb, {}, skipped) == 0.0
+    assert evaluator.hpwl_profile["candidate_calls"] == 3
+    assert evaluator.hpwl_profile["candidate_pin_visits"] == 3 * len(net.pins)
+
+
 class FakeFeedthroughContext:
     """Small test double that records feedthrough calls without starting ftpred."""
 

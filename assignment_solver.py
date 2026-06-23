@@ -620,6 +620,7 @@ class AssignmentSolver:
         profile = getattr(mcts, "timing_profile", {})
         reward_profile = getattr(getattr(mcts, "reward_evaluator", None), "timing_profile", {})
         child_counts = getattr(mcts, "child_generation_counts", {})
+        hpwl_profile = getattr(getattr(mcts, "reward_evaluator", None), "hpwl_profile", {})
 
         def elapsed(key: str, source: Dict[str, float]) -> float:
             return source.get(key, 0.0)
@@ -635,7 +636,7 @@ class AssignmentSolver:
             "related_groups=%d search_groups=%d committable_groups=%d "
             "skipped_groups=%d prior_assigned_groups=%d committed_groups=%d "
             "simulations=%d mcts_main_s=%.6f reward_total_s=%.6f "
-            "reward_hpwl_s=%.6f reward_ft_s=%.6f "
+            "reward_hpwl_s=%.6f reward_hpwl_reference_s=%.6f reward_ft_s=%.6f "
             "select_s=%.6f expand_s=%.6f child_generation_s=%.6f "
             "child_actions_s=%.6f child_feasible_s=%.6f child_pruning_s=%.6f "
             "child_create_s=%.6f child_usage_clone_s=%.6f child_assignment_copy_s=%.6f "
@@ -644,6 +645,8 @@ class AssignmentSolver:
             "beam_select_s=%.6f best_extract_s=%.6f "
             "child_beam_nodes=%d child_action_requests=%d child_actions=%d "
             "children_created=%d child_pruning_cache_hits=%d child_pruning_cache_misses=%d "
+            "hpwl_candidate_calls=%d hpwl_candidate_pin_visits=%d "
+            "hpwl_temporary_location_hits=%d hpwl_base_location_hits=%d "
             "true_skip_check_s=%.6f commit_s=%.6f",
             self.assignment_rounds,
             datetime.now().isoformat(timespec="seconds"),
@@ -661,6 +664,7 @@ class AssignmentSolver:
             mcts_main_elapsed,
             reward_total,
             elapsed("reward_hpwl", reward_profile),
+            elapsed("reward_hpwl_reference", reward_profile),
             elapsed("reward_feedthrough", reward_profile),
             elapsed("select", profile),
             elapsed("expand", profile),
@@ -683,6 +687,10 @@ class AssignmentSolver:
             child_counts.get("children_created", 0),
             child_counts.get("candidate_pruning_order_cache_hits", 0),
             child_counts.get("candidate_pruning_order_cache_misses", 0),
+            hpwl_profile.get("candidate_calls", 0),
+            hpwl_profile.get("candidate_pin_visits", 0),
+            hpwl_profile.get("temporary_location_hits", 0),
+            hpwl_profile.get("base_location_hits", 0),
             skip_elapsed,
             commit_elapsed,
         )

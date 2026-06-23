@@ -35,6 +35,8 @@ class Pin:
         self.scope = scope
         self.successors = successors
         self.width = float(width)
+        self._full_name = f"{parent_inst}.{pingroup_name}"
+        self._homology_name = f"{parent_module}.{pingroup_name}"
         self.x = 0.0
         self.y = 0.0
         self.assigned_segment_coord = None
@@ -45,16 +47,16 @@ class Pin:
     @property
     def full_name(self) -> str:
         """返回 Pin 的实例唯一名称：parent_inst.pingroup_name。"""
-        return self.get_full_name()
+        return self._full_name
 
     @property
     def homology_name(self) -> str:
         """返回同构 Pin 的分组名称：parent_module.pingroup_name。"""
-        return f"{self.parent_module}.{self.pingroup_name}"
+        return self._homology_name
 
     def get_full_name(self) -> str:
         """拼接并返回当前 Pin 的完整实例名。"""
-        return f"{self.parent_inst}.{self.pingroup_name}"
+        return self._full_name
 
     def __repr__(self) -> str:
         """返回便于调试的 Pin 字符串。"""
@@ -131,6 +133,7 @@ class Module:
         self.polygon = Polygon(vertex)
         self.area = self.polygon.area
         self.pin_list: List[Pin] = []
+        self._centroid: tuple[float, float] | None = None
 
         for child in self.children:
             child.parent = self
@@ -191,7 +194,9 @@ class Module:
 
     def get_centroid(self) -> tuple[float, float]:
         """返回模块多边形的质心坐标。"""
-        return centroid(self.vertex)
+        if self._centroid is None:
+            self._centroid = centroid(self.vertex)
+        return self._centroid
 
     def is_leaf(self) -> bool:
         """判断当前模块是否没有子模块。"""
