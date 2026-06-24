@@ -1028,7 +1028,7 @@ def test_basic_depth1_search_uses_reward_greedy_without_simulation(tmp_path):
         def __init__(self):
             self.calls = 0
 
-        def evaluate(self, temporary_locations):
+        def evaluate(self, temporary_locations, compute_pin_names=None):
             self.calls += 1
             points = set(temporary_locations.values())
             return 10.0 if preferred_points <= points else 0.0
@@ -1443,7 +1443,7 @@ def test_assignment_greedy_selects_reward_best_feasible_segment(tmp_path):
         def __init__(self, *args, **kwargs):
             pass
 
-        def evaluate(self, temporary_locations):
+        def evaluate(self, temporary_locations, compute_pin_names=None):
             return (
                 100.0
                 if any(point == preferred.instances[pin.parent_inst].midpoint for pin, point in [
@@ -1547,6 +1547,28 @@ class FakeFeedthroughContext:
         self.closed = True
 
 
+class FakeFixedComputeFeedthroughContext(FakeFeedthroughContext):
+    """Record the fixed/compute split used by the incremental FT path."""
+
+    def run_one_net_at_fixed_compute_locations_cached(
+        self,
+        net,
+        cache_key,
+        locations_factory,
+        skipped_pin_names=None,
+    ):
+        fixed_locations, compute_locations = locations_factory()
+        self.calls.append(
+            (
+                net.net_id,
+                tuple(sorted(fixed_locations)),
+                tuple(sorted(compute_locations)),
+                tuple(sorted(skipped_pin_names or set())),
+            )
+        )
+        return 0.0
+
+
 def test_reward_evaluator_uses_shared_feedthrough_context(tmp_path):
     """Feedthrough references and candidates must call the injected context."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -1566,6 +1588,39 @@ def test_reward_evaluator_uses_shared_feedthrough_context(tmp_path):
     assert reference_call_count == len(placedb.nets_list)
     assert len(context.calls) == reference_call_count + len(placedb.nets_list)
     assert not context.closed
+
+
+def test_reward_evaluator_splits_fixed_and_compute_pins_for_feedthrough(tmp_path):
+    """The incremental FT path receives stable fixed pins and candidate compute pins."""
+    block_path, pingroup_path = write_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    net = placedb.nets_list[0]
+    context = FakeFixedComputeFeedthroughContext()
+
+    evaluator = RewardEvaluator(
+        [net],
+        placedb,
+        feedthrough_weight=1.0,
+        enable_feedthrough=True,
+        feedthrough_context=context,
+    )
+    context.calls.clear()
+
+    moving_pin = net.pins[0].full_name
+    fixed_pin = net.pins[1].full_name
+    evaluator.evaluate(
+        {
+            moving_pin: (35.0, 5.0),
+            fixed_pin: placedb.get_pin_location_estimate(net.pins[1]),
+        },
+        compute_pin_names={moving_pin},
+    )
+
+    assert context.calls
+    _, fixed_names, compute_names, skipped_names = context.calls[-1]
+    assert moving_pin in compute_names
+    assert fixed_pin in fixed_names
+    assert skipped_names == ()
 
 
 def test_mcts_solvers_share_one_feedthrough_context(tmp_path):

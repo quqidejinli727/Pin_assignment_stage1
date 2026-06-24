@@ -92,6 +92,7 @@ class FeedthroughContext:
         self.ftpred_loader = load_ftpred_loader(feedthrough_source_dir, role)
         modules_text = self.ftpred_loader.build_modules_text(placedb)
         self.session = self.ftpred_loader.FtpredBinSession(str(executable), modules_text)
+        self.supports_fixed_compute = hasattr(self.session, "run_fixed_plus_compute")
         self.feedthrough_cache: Dict[Tuple[object, ...], float] = {}
         self.cache_hits = 0
         self.cache_misses = 0
@@ -136,6 +137,52 @@ class FeedthroughContext:
             net.pins = old_net_pins
             net.feedthrough = old_net_feedthrough
 
+    def run_one_net_at_fixed_compute_locations(
+        self,
+        net: Net,
+        fixed_locations: Dict[str, Point],
+        compute_locations: Dict[str, Point],
+        skipped_pin_names: Set[str] | None = None,
+    ) -> float:
+        """Evaluate FT with the optional fixed+compute incremental predictor API."""
+        if self.session is None:
+            raise RuntimeError("FeedthroughContext has already been closed.")
+        if not self.supports_fixed_compute:
+            locations = dict(fixed_locations)
+            locations.update(compute_locations)
+            return self.run_one_net_at_locations(net, locations, skipped_pin_names)
+
+        skipped_pin_names = skipped_pin_names or set()
+        old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
+        old_pin_scopes = [(pin, pin.scope) for pin in net.pins]
+        old_net_feedthrough = getattr(net, "feedthrough", 0.0)
+        fixed_pins = []
+        compute_pins = []
+        try:
+            for pin in net.pins:
+                pin_name = pin.full_name
+                if pin_name in skipped_pin_names:
+                    pin.scope = []
+                    continue
+                point = compute_locations.get(pin_name, _MISSING_POINT)
+                if point is not _MISSING_POINT:
+                    pin.x, pin.y = point
+                    compute_pins.append(pin)
+                    continue
+                point = fixed_locations.get(pin_name, _MISSING_POINT)
+                if point is not _MISSING_POINT:
+                    pin.x, pin.y = point
+                    fixed_pins.append(pin)
+            with redirect_stdout(StringIO()):
+                return float(self.session.run_fixed_plus_compute(fixed_pins, compute_pins))
+        finally:
+            for pin, x, y in old_pin_locations:
+                pin.x = x
+                pin.y = y
+            for pin, scope in old_pin_scopes:
+                pin.scope = scope
+            net.feedthrough = old_net_feedthrough
+
     def run_one_net_at_locations_cached(
         self,
         net: Net,
@@ -149,6 +196,28 @@ class FeedthroughContext:
             return self.feedthrough_cache[cache_key]
         self.cache_misses += 1
         value = self.run_one_net_at_locations(net, locations_factory(), skipped_pin_names)
+        self.feedthrough_cache[cache_key] = value
+        return value
+
+    def run_one_net_at_fixed_compute_locations_cached(
+        self,
+        net: Net,
+        cache_key: Tuple[object, ...],
+        locations_factory: Callable[[], Tuple[Dict[str, Point], Dict[str, Point]]],
+        skipped_pin_names: Set[str] | None = None,
+    ) -> float:
+        """Evaluate one net with fixed/compute locations and cache exact requests."""
+        if cache_key in self.feedthrough_cache:
+            self.cache_hits += 1
+            return self.feedthrough_cache[cache_key]
+        self.cache_misses += 1
+        fixed_locations, compute_locations = locations_factory()
+        value = self.run_one_net_at_fixed_compute_locations(
+            net,
+            fixed_locations,
+            compute_locations,
+            skipped_pin_names,
+        )
         self.feedthrough_cache[cache_key] = value
         return value
 
@@ -229,7 +298,11 @@ class RewardEvaluator:
         """Release local evaluator caches without closing the shared predictor."""
         self._pin_estimate_cache.clear()
 
-    def evaluate(self, temporary_locations: Dict[str, Point]) -> float:
+    def evaluate(
+        self,
+        temporary_locations: Dict[str, Point],
+        compute_pin_names: Set[str] | None = None,
+    ) -> float:
         """Return weighted normalized reward for a complete candidate assignment."""
         started = time.perf_counter()
         total_reward = 0.0
@@ -243,7 +316,11 @@ class RewardEvaluator:
             feedthrough_reward_value = 0.0
             if self.enable_feedthrough:
                 ft_started = time.perf_counter()
-                candidate_feedthrough = self._candidate_feedthrough(net, temporary_locations)
+                candidate_feedthrough = self._candidate_feedthrough(
+                    net,
+                    temporary_locations,
+                    compute_pin_names,
+                )
                 self.timing_profile["reward_feedthrough"] += time.perf_counter() - ft_started
                 feedthrough_reward_value = self._normalized_improvement(
                     reference.feedthrough,
@@ -352,27 +429,33 @@ class RewardEvaluator:
         self,
         net: Net,
         temporary_locations: Dict[str, Point],
+        compute_pin_names: Set[str] | None = None,
     ) -> float:
         net_id = id(net)
         base_locations = self._net_base_locations[net_id]
         net_pin_names = self._net_pin_names[net_id]
-        changed = []
-        for pin_name, point in temporary_locations.items():
-            if pin_name not in net_pin_names:
-                continue
-            rounded = self._rounded_point(point)
-            if rounded != self._rounded_point(base_locations[pin_name]):
-                changed.append((pin_name, rounded))
+        fixed_locations, compute_locations = self._net_fixed_compute_locations(
+            net,
+            temporary_locations,
+            compute_pin_names,
+        )
+        fixed_key = tuple(
+            sorted((pin_name, self._rounded_point(point)) for pin_name, point in fixed_locations.items())
+        )
+        compute_key = tuple(
+            sorted((pin_name, self._rounded_point(point)) for pin_name, point in compute_locations.items())
+        )
         key = (
-            "candidate",
+            "fixed_compute_candidate",
             net_id,
             tuple(sorted(self.skipped_pin_names)),
-            tuple(sorted(changed)),
+            fixed_key,
+            compute_key,
         )
-        return self._feedthrough_at_locations(
+        return self._feedthrough_at_fixed_compute_locations(
             net,
             key,
-            lambda: self._net_locations_from_changes(net, temporary_locations),
+            lambda: (fixed_locations, compute_locations),
             self.skipped_pin_names,
         )
 
@@ -427,6 +510,46 @@ class RewardEvaluator:
         self.timing_profile["reward_feedthrough_location"] += loc_elapsed
         return value
 
+    def _feedthrough_at_fixed_compute_locations(
+        self,
+        net: Net,
+        cache_key: Tuple[object, ...],
+        locations_factory: Callable[[], Tuple[Dict[str, Point], Dict[str, Point]]],
+        skipped_pin_names: Set[str] | None = None,
+    ) -> float:
+        if self.feedthrough_context is None:
+            return 0.0
+        if not hasattr(self.feedthrough_context, "run_one_net_at_fixed_compute_locations_cached"):
+            fixed_locations, compute_locations = locations_factory()
+            merged = dict(fixed_locations)
+            merged.update(compute_locations)
+            return self._feedthrough_at_locations(
+                net,
+                cache_key,
+                lambda: merged,
+                skipped_pin_names,
+            )
+
+        loc_elapsed = 0.0
+
+        def timed_locations_factory():
+            nonlocal loc_elapsed
+            started = time.perf_counter()
+            locations = locations_factory()
+            loc_elapsed += time.perf_counter() - started
+            return locations
+
+        eval_started = time.perf_counter()
+        value = self.feedthrough_context.run_one_net_at_fixed_compute_locations_cached(
+            net,
+            cache_key,
+            timed_locations_factory,
+            skipped_pin_names,
+        )
+        self.timing_profile["reward_feedthrough_eval"] += time.perf_counter() - eval_started
+        self.timing_profile["reward_feedthrough_location"] += loc_elapsed
+        return value
+
     def _normalized_improvement(self, reference: float, candidate: float) -> float:
         denominator = max(abs(reference), self.normalization_floor)
         return (reference - candidate) / denominator
@@ -448,6 +571,35 @@ class RewardEvaluator:
             if pin_name in net_pin_names:
                 locations[pin_name] = point
         return locations
+
+    def _net_fixed_compute_locations(
+        self,
+        net: Net,
+        temporary_locations: Dict[str, Point],
+        compute_pin_names: Set[str] | None = None,
+    ) -> Tuple[Dict[str, Point], Dict[str, Point]]:
+        """Split current net locations into stable fixed pins and changing compute pins."""
+        base_locations = self._net_base_locations[id(net)]
+        net_pin_names = self._net_pin_names[id(net)]
+        if compute_pin_names is None:
+            compute_names = {
+                pin_name
+                for pin_name, point in temporary_locations.items()
+                if pin_name in net_pin_names
+                and self._rounded_point(point) != self._rounded_point(base_locations[pin_name])
+            }
+        else:
+            compute_names = set(compute_pin_names).intersection(net_pin_names)
+
+        fixed_locations: Dict[str, Point] = {}
+        compute_locations: Dict[str, Point] = {}
+        for pin_name in net_pin_names:
+            point = temporary_locations.get(pin_name, base_locations[pin_name])
+            if pin_name in compute_names:
+                compute_locations[pin_name] = point
+            else:
+                fixed_locations[pin_name] = point
+        return fixed_locations, compute_locations
 
     @staticmethod
     def _rounded_point(point: Point) -> Point:

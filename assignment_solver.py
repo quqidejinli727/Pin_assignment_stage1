@@ -548,7 +548,10 @@ class AssignmentSolver:
                 temporary_locations = self._temporary_locations_for_group(group, segment.segment_id)
                 if len(temporary_locations) != len(group.pins):
                     continue
-                reward = evaluator.evaluate(temporary_locations)
+                reward = evaluator.evaluate(
+                    temporary_locations,
+                    compute_pin_names={pin.full_name for pin in group.pins},
+                )
                 if (
                     best_segment is None
                     or reward > best_reward

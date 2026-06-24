@@ -904,6 +904,7 @@ class MCTSSolver:
         started = time.perf_counter()
         usage = node.usage.clone()
         assignments = dict(node.assignments)
+        compute_pin_names = self._node_action_pin_names(node)
         for index in range(node.group_index, len(self.groups)):
             group = self.groups[index]
             self.simulation_counts["groups_visited"] += 1
@@ -932,13 +933,17 @@ class MCTSSolver:
             )
             self.simulation_counts["usage_assignments"] += 1
             assignments[group.name] = segment.segment_id
+            compute_pin_names.update(pin.full_name for pin in group.pins)
         self.timing_profile["simulate_completion"] += time.perf_counter() - started
 
         started = time.perf_counter()
         temporary_locations = self._temporary_locations(assignments)
         self.timing_profile["temporary_locations"] += time.perf_counter() - started
         started = time.perf_counter()
-        reward = self.reward_evaluator.evaluate(temporary_locations)
+        reward = self.reward_evaluator.evaluate(
+            temporary_locations,
+            compute_pin_names=compute_pin_names,
+        )
         self.timing_profile["reward"] += time.perf_counter() - started
         return reward
 
@@ -958,6 +963,18 @@ class MCTSSolver:
                     continue
                 locations[pin.full_name] = instance.midpoint
         return locations
+
+    def _node_action_pin_names(self, node: MCTSNode) -> set[str]:
+        """Return pins changed by the current node action for fixed/compute FT."""
+        if node.action is None:
+            return set()
+        group_name, segment_id = node.action
+        if segment_id == SKIP_SEGMENT_ID:
+            return set()
+        group = self.groups_by_name.get(group_name)
+        if group is None:
+            return set()
+        return {pin.full_name for pin in group.pins}
 
     def _backpropagate(self, node: MCTSNode, reward: float) -> None:
         """Internal helper."""
@@ -1030,7 +1047,8 @@ class MCTSSolver:
             candidate_assignments = dict(assignments)
             candidate_assignments[group.name] = segment.segment_id
             reward = self.reward_evaluator.evaluate(
-                self._temporary_locations(candidate_assignments)
+                self._temporary_locations(candidate_assignments),
+                compute_pin_names={pin.full_name for pin in group.pins},
             )
             if (
                 best_segment is None
