@@ -434,28 +434,23 @@ class RewardEvaluator:
         net_id = id(net)
         base_locations = self._net_base_locations[net_id]
         net_pin_names = self._net_pin_names[net_id]
-        fixed_locations, compute_locations = self._net_fixed_compute_locations(
-            net,
-            temporary_locations,
-            compute_pin_names,
-        )
-        fixed_key = tuple(
-            sorted((pin_name, self._rounded_point(point)) for pin_name, point in fixed_locations.items())
-        )
-        compute_key = tuple(
-            sorted((pin_name, self._rounded_point(point)) for pin_name, point in compute_locations.items())
-        )
+        changed = []
+        for pin_name, point in temporary_locations.items():
+            if pin_name not in net_pin_names:
+                continue
+            rounded = self._rounded_point(point)
+            if rounded != self._rounded_point(base_locations[pin_name]):
+                changed.append((pin_name, rounded))
         key = (
-            "fixed_compute_candidate",
+            "candidate",
             net_id,
             tuple(sorted(self.skipped_pin_names)),
-            fixed_key,
-            compute_key,
+            tuple(sorted(changed)),
         )
-        return self._feedthrough_at_fixed_compute_locations(
+        return self._feedthrough_at_locations(
             net,
             key,
-            lambda: (fixed_locations, compute_locations),
+            lambda: self._net_locations_from_changes(net, temporary_locations),
             self.skipped_pin_names,
         )
 

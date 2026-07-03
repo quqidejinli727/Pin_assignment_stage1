@@ -1547,28 +1547,6 @@ class FakeFeedthroughContext:
         self.closed = True
 
 
-class FakeFixedComputeFeedthroughContext(FakeFeedthroughContext):
-    """Record the fixed/compute split used by the incremental FT path."""
-
-    def run_one_net_at_fixed_compute_locations_cached(
-        self,
-        net,
-        cache_key,
-        locations_factory,
-        skipped_pin_names=None,
-    ):
-        fixed_locations, compute_locations = locations_factory()
-        self.calls.append(
-            (
-                net.net_id,
-                tuple(sorted(fixed_locations)),
-                tuple(sorted(compute_locations)),
-                tuple(sorted(skipped_pin_names or set())),
-            )
-        )
-        return 0.0
-
-
 def test_reward_evaluator_uses_shared_feedthrough_context(tmp_path):
     """Feedthrough references and candidates must call the injected context."""
     block_path, pingroup_path = write_case(tmp_path)
@@ -1590,12 +1568,12 @@ def test_reward_evaluator_uses_shared_feedthrough_context(tmp_path):
     assert not context.closed
 
 
-def test_reward_evaluator_splits_fixed_and_compute_pins_for_feedthrough(tmp_path):
-    """The incremental FT path receives stable fixed pins and candidate compute pins."""
+def test_reward_evaluator_uses_full_net_feedthrough_when_compute_pins_are_provided(tmp_path):
+    """Compute-pin hints must not change the full-net feedthrough reward semantics."""
     block_path, pingroup_path = write_case(tmp_path)
     placedb = PlaceDB(str(block_path), str(pingroup_path))
     net = placedb.nets_list[0]
-    context = FakeFixedComputeFeedthroughContext()
+    context = FakeFeedthroughContext()
 
     evaluator = RewardEvaluator(
         [net],
@@ -1617,10 +1595,9 @@ def test_reward_evaluator_splits_fixed_and_compute_pins_for_feedthrough(tmp_path
     )
 
     assert context.calls
-    _, fixed_names, compute_names, skipped_names = context.calls[-1]
-    assert moving_pin in compute_names
-    assert fixed_pin in fixed_names
-    assert skipped_names == ()
+    _, location_names = context.calls[-1]
+    assert moving_pin in location_names
+    assert fixed_pin in location_names
 
 
 def test_mcts_solvers_share_one_feedthrough_context(tmp_path):

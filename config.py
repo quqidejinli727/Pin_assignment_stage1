@@ -40,21 +40,22 @@ class RunConfig:
     cmake_generator: str = "MinGW Makefiles"
 
     # Common MCTS settings
-    simulations: int = 4096
+    simulations: int = 5120
     random_seed: int = 7
     allow_overflow_fallback: bool = True
     mcts_search_mode: str = "hybrid"
     mcts_enable_search_diagnostics: bool = False
     mcts_search_each_pingroup_once: bool = False
+    assignment_rescan_until_stable: bool = False
 
     # Basic mode settings
     mcts_basic_dynamic_simulations: bool = True
     mcts_basic_space_scale_divisor: float = 100_000.0
     mcts_basic_max_space_factor: float = 8.0
-    mcts_basic_min_simulations: int = 1024
+    mcts_basic_min_simulations: int = 1280
     mcts_enable_depth1_greedy: bool = True
-    mcts_basic_depth1_simulations: int = 32
-    mcts_basic_depth2_simulations: int = 512
+    mcts_basic_depth1_simulations: int = 40
+    mcts_basic_depth2_simulations: int = 640
     mcts_basic_disable_pruning_depth_limit: int = 2
 
     # Hybrid mode settings
@@ -65,25 +66,25 @@ class RunConfig:
     mcts_hybrid_tail_depth: int = 24
     mcts_hybrid_budget_decay: float = 0.65
     mcts_hybrid_tail_budget_decay: float = 0.92
-    mcts_hybrid_min_layer_simulations: int = 96
-    mcts_hybrid_max_layer_simulations: int = 1024
-    mcts_hybrid_max_tree_simulations: int = 30_000
+    mcts_hybrid_min_layer_simulations: int = 128
+    mcts_hybrid_max_layer_simulations: int = 1280
+    mcts_hybrid_max_tree_simulations: int = 36_000
     mcts_hybrid_enable_layer_early_stop: bool = True
     mcts_hybrid_early_stop_std_multiplier: float = 2.0
     mcts_hybrid_time_limit_seconds: float = 0.0
 
     # Hybrid ultradeep profile settings
-    mcts_hybrid_enable_ultradeep_profile: bool = True
+    mcts_hybrid_enable_ultradeep_profile: bool = False
     mcts_hybrid_ultradeep_depth: int = 100
     mcts_hybrid_max_expanded_depth: int = 64
     mcts_hybrid_ultradeep_beam_width: int = 1
-    mcts_hybrid_ultradeep_min_layer_simulations: int = 32
-    mcts_hybrid_ultradeep_max_layer_simulations: int = 128
+    mcts_hybrid_ultradeep_min_layer_simulations: int = 40
+    mcts_hybrid_ultradeep_max_layer_simulations: int = 160
     mcts_hybrid_use_fast_completion_for_ultradeep: bool = True
 
     # Homology settings
     homology_use_fanout_reuse_for_sorting: bool = False
-    homology_skip_uncovered_groups: bool = True
+    homology_skip_uncovered_groups: bool = False
     homology_skip_coverage_threshold: float = 1.0
     homology_group_commit_coverage_threshold: float = 1.0
 

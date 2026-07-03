@@ -36,6 +36,7 @@ class AssignmentSolver:
         mcts_search_mode: str = "hybrid",
         mcts_enable_search_diagnostics: bool = False,
         mcts_search_each_pingroup_once: bool = False,
+        assignment_rescan_until_stable: bool = False,
         mcts_basic_dynamic_simulations: bool = True,
         mcts_basic_space_scale_divisor: float = 100_000.0,
         mcts_basic_max_space_factor: float = 8.0,
@@ -127,6 +128,7 @@ class AssignmentSolver:
         self.homology_skip_coverage_threshold = homology_skip_coverage_threshold
         self.homology_group_commit_coverage_threshold = homology_group_commit_coverage_threshold
         self.mcts_search_each_pingroup_once = mcts_search_each_pingroup_once
+        self.assignment_rescan_until_stable = assignment_rescan_until_stable
         self.mcts_options = {
             "search_mode": mcts_search_mode,
             "enable_search_diagnostics": mcts_enable_search_diagnostics,
@@ -308,7 +310,11 @@ class AssignmentSolver:
                 made_progress = committed_count > 0 or made_progress
                 self.assignment_rounds += 1
 
-            if self.assigned_group_count >= len(self.homology.pin_groups) or not made_progress:
+            if (
+                not self.assignment_rescan_until_stable
+                or self.assigned_group_count >= len(self.homology.pin_groups)
+                or not made_progress
+            ):
                 break
 
         self._finalize_unassigned_groups()
