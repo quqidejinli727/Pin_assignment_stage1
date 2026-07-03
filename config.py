@@ -34,7 +34,7 @@ class RunConfig:
     feedthrough_source_dir: Path = PROJECT_DIR / "feedthrough"
     feedthrough_predict_source_dir: Path = PROJECT_DIR / "feedthrough_predict"
     feedthrough_evaluate_source_dir: Path = PROJECT_DIR / "feedthrough_evaluate"
-    feedthrough_reward_source: str = "evaluate"
+    feedthrough_reward_source: str = "predict"
     enable_feedthrough: bool = True
     auto_build_feedthrough: bool = False
     cmake_generator: str = "MinGW Makefiles"
@@ -46,6 +46,7 @@ class RunConfig:
     mcts_search_mode: str = "hybrid"
     mcts_enable_search_diagnostics: bool = False
     mcts_search_each_pingroup_once: bool = False
+    assignment_rescan_until_stable: bool = False
 
     # Basic mode settings
     mcts_basic_dynamic_simulations: bool = True
@@ -73,7 +74,7 @@ class RunConfig:
     mcts_hybrid_time_limit_seconds: float = 0.0
 
     # Hybrid ultradeep profile settings
-    mcts_hybrid_enable_ultradeep_profile: bool = True
+    mcts_hybrid_enable_ultradeep_profile: bool = False
     mcts_hybrid_ultradeep_depth: int = 100
     mcts_hybrid_max_expanded_depth: int = 64
     mcts_hybrid_ultradeep_beam_width: int = 1

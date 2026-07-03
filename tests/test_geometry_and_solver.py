@@ -1671,7 +1671,7 @@ def test_assignment_solver_selects_feedthrough_reward_source(tmp_path):
         assignment_solver_module.FeedthroughContext = original_context
 
     assert created[0] == (evaluate_dir, "evaluate")
-    assert created[1] == (evaluate_dir, "evaluate")
+    assert created[1] == (predict_dir, "predict")
 
 
 def test_assignment_solver_skips_context_when_feedthrough_reward_is_disabled(tmp_path):
