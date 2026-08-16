@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import struct
-from typing import Optional
+from typing import Optional, Union, Any
 
 from PlaceDB import PlaceDB
 
@@ -61,7 +61,214 @@ def _pin_coord(pin):
     return (float(getattr(pin, "x")), float(getattr(pin, "y")))
 
 
-def _find_parent_nonleaf_inst(db: PlaceDB, leaf_inst: str) -> str | None:
+def _pin_full_name(pin) -> Optional[str]:
+    """Return the canonical pingroup full name: parent_inst + '.' + pingroup_name.
+
+    The uploaded pingroup.json uses exactly this convention in `successors`:
+      successor string == target.parent_inst + "." + target.pingroup_name
+
+    We still accept a few compatibility attributes, but the strict key is always
+    preferred when parent_inst and pingroup_name are present.
+    """
+    parent = (
+        getattr(pin, "parent_inst", None)
+        or getattr(pin, "parent", None)
+        or getattr(pin, "inst", None)
+    )
+    pgname = (
+        getattr(pin, "pingroup_name", None)
+        or getattr(pin, "pin_group_name", None)
+        or getattr(pin, "pin_name", None)
+        or getattr(pin, "name", None)
+    )
+    if parent and pgname:
+        return f"{parent}.{pgname}"
+
+    for attr in ("full_name", "fullname", "global_name", "full_pin_name"):
+        val = getattr(pin, attr, None)
+        if val:
+            return str(val)
+    return None
+
+
+def _pin_lookup_keys(pin) -> list[Any]:
+    """Keys used to resolve successor references.
+
+    Primary key is the pingroup full name. Extra keys are compatibility only.
+    """
+    keys: list[Any] = [pin, id(pin)]
+
+    full = _pin_full_name(pin)
+    if full:
+        keys.append(full)
+
+    parent = getattr(pin, "parent_inst", None)
+    pgname = getattr(pin, "pingroup_name", None)
+    if parent and pgname:
+        keys.append((parent, pgname))
+
+    for attr in (
+        "id", "uid", "idx", "index",
+        "pingroup_name", "pin_group_name", "pin_name", "name",
+        "full_name", "fullname", "global_name", "full_pin_name",
+    ):
+        val = getattr(pin, attr, None)
+        if val is not None:
+            keys.append(val)
+            keys.append(str(val))
+
+    # De-duplicate while preserving order and ignoring unhashable values.
+    out: list[Any] = []
+    seen = set()
+    for k in keys:
+        try:
+            if k in seen:
+                continue
+            seen.add(k)
+            out.append(k)
+        except TypeError:
+            out.append(k)
+    return out
+
+
+def _build_pin_lookup(pins: list) -> dict[Any, Any]:
+    lookup: dict[Any, Any] = {}
+    for i, pin in enumerate(pins):
+        lookup[i] = pin
+        lookup[str(i)] = pin
+        for key in _pin_lookup_keys(pin):
+            try:
+                lookup[key] = pin
+            except TypeError:
+                pass
+    return lookup
+
+
+def _normalize_successor_list(value) -> list:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)):
+        return [value.decode() if isinstance(value, bytes) else value]
+    if isinstance(value, dict):
+        # e.g. {successor_name: weight}. Successor references are the keys.
+        return list(value.keys())
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
+
+
+def _successor_refs(pin) -> list:
+    refs: list = []
+    for attr in ("successors", "successor", "succs", "succ", "next_pins", "next"):
+        if hasattr(pin, attr):
+            refs.extend(_normalize_successor_list(getattr(pin, attr)))
+    return refs
+
+
+def _resolve_pin_ref(ref, lookup: dict[Any, Any]):
+    """Resolve a successor reference to the target pin object.
+
+    The expected reference form is a string such as
+    'TOP.U_X...<parent_inst>.<pingroup_name>'. Direct object references and
+    compatibility keys are also accepted.
+    """
+    if hasattr(ref, "x") and hasattr(ref, "y"):
+        return ref
+    candidates = [ref]
+    try:
+        candidates.append(str(ref))
+    except Exception:
+        pass
+    for key in candidates:
+        try:
+            if key in lookup:
+                return lookup[key]
+        except TypeError:
+            pass
+    return None
+
+
+def _extract_successor_pairs_strict(net):
+    """Extract explicit pin->successor pairs from a PlaceDB net.
+
+    This implements the pingroup.json semantics:
+      src_full_name = src.parent_inst + "." + src.pingroup_name
+      each src.successors item is dst_full_name
+
+    No p0->p1->... chain fallback is used here. If a successor cannot be
+    resolved inside this net's pin set, it is reported in the returned stats.
+    """
+    pins = list(getattr(net, "pins", []) or [])
+    lookup = _build_pin_lookup(pins)
+    pairs: list[tuple[Any, Any]] = []
+    seen = set()
+    missing: list[tuple[str, str]] = []
+
+    def add_pair(src, dst_ref):
+        dst = _resolve_pin_ref(dst_ref, lookup)
+        if dst is None:
+            src_name = _pin_full_name(src) or str(getattr(src, "pingroup_name", "<unknown-src>"))
+            missing.append((src_name, str(dst_ref)))
+            return
+        if src is dst:
+            return
+        key = (id(src), id(dst))
+        if key in seen:
+            return
+        seen.add(key)
+        pairs.append((src, dst))
+
+    # 1) Preferred: pin-level successors, matching pingroup.json.
+    for pin in pins:
+        for dst_ref in _successor_refs(pin):
+            add_pair(pin, dst_ref)
+
+    # 2) Compatibility: net-level edge tables if PlaceDB materialized them.
+    if not pairs:
+        for attr in ("successor_edges", "edges", "pairs", "pin_pairs"):
+            raw_edges = getattr(net, attr, None)
+            if not raw_edges:
+                continue
+            for e in _normalize_successor_list(raw_edges):
+                if isinstance(e, dict):
+                    src = e.get("src", e.get("source", e.get("from", e.get("u"))))
+                    dst = e.get("dst", e.get("target", e.get("to", e.get("v"))))
+                    if src is not None and dst is not None:
+                        src_pin = _resolve_pin_ref(src, lookup)
+                        if src_pin is not None:
+                            add_pair(src_pin, dst)
+                elif isinstance(e, (list, tuple)) and len(e) >= 2:
+                    src_pin = _resolve_pin_ref(e[0], lookup)
+                    if src_pin is not None:
+                        add_pair(src_pin, e[1])
+            if pairs:
+                break
+
+    return pairs, {"missing_successors": missing, "pin_count": len(pins), "edge_count": len(pairs)}
+
+
+def build_successor_edge_coords(
+    db: PlaceDB,
+    net,
+    *,
+    split_nonleaf_nets: bool = True,
+    return_stats: bool = False,
+):
+    """Expand one PlaceDB net into two-pin successor edges.
+
+    Strict pingroup semantics are used. The function does NOT interpret
+    net.pins order as p0->p1->...; unordered pins without explicit successors
+    produce zero child edges.
+    """
+    pairs, stats = _extract_successor_pairs_strict(net)
+    edges = [(_pin_coord(a), _pin_coord(b)) for a, b in pairs]
+    if return_stats:
+        return edges, stats
+    return edges
+
+
+def _find_parent_nonleaf_inst(db: PlaceDB, leaf_inst: str) -> Optional[str]:
     """
     给出一个叶模块，向上找出其最近的非叶模块。
     找不到则返回 None。
@@ -144,77 +351,51 @@ def build_nets_text_all(
     return_stats: bool = True,
     split_nonleaf_nets: bool = True,
 ):
-    """（已弃用：全网模式）将所有 nets 转换为 ftpred 需要的格式。
+    """将所有 nets 转换为 ftpred 文本格式。
 
-    现在推荐使用 build_nets_text(db, net_idx, ...) 只处理单个 net。
-    这里保留全网实现仅作为参考/回归用，不再被 text.py 等脚本调用。
+    当前语义：一个 PlaceDB net 会被严格展开为 pingroup.json 中定义的
+    pin->successor 二端 child nets。
+
+    full pin name = parent_inst + "." + pingroup_name；successors 中的
+    字符串必须能在同一个 net 的 pin 集合中解析到目标 pin。
+    不再把 net.pins 的相邻顺序当作 p0->p1->... chain fallback。
     """
-    child_nets_coords = []  # List[List[(x,y)]]
-    orig_to_children = {}
+    child_edges: list[tuple[tuple[float, float], tuple[float, float]]] = []
+    orig_to_children: dict[int, list[int]] = {}
+    missing_by_orig: dict[int, list[tuple[str, str]]] = {}
+    edge_count_by_orig: dict[int, int] = {}
 
-    for orig_idx, net in enumerate(db.nets_list):
-        leaf_pins = []  # List[pin]
-        nonleaf_pins_by_inst = {}  
+    for orig_idx, net in enumerate(getattr(db, "nets_list", []) or []):
+        edge_coords, edge_stats = build_successor_edge_coords(
+            db,
+            net,
+            split_nonleaf_nets=split_nonleaf_nets,
+            return_stats=True,
+        )
+        child_ids: list[int] = []
+        for edge in edge_coords:
+            child_ids.append(len(child_edges))
+            child_edges.append(edge)
+        orig_to_children[orig_idx] = child_ids
+        if edge_stats.get("missing_successors"):
+            missing_by_orig[orig_idx] = edge_stats["missing_successors"]
+        edge_count_by_orig[orig_idx] = int(edge_stats.get("edge_count", len(edge_coords)))
 
-        for pin in getattr(net, "pins", []):
-            parent_inst = getattr(pin, "parent_inst", None)
-            if parent_inst and _is_nonleaf_module(db, parent_inst):
-                nonleaf_pins_by_inst.setdefault(parent_inst, []).append(_pin_coord(pin))
-            else:
-                leaf_pins.append(pin)
-
-        nonleaf_coords_all = []
-        for coords in nonleaf_pins_by_inst.values():
-            nonleaf_coords_all.extend(coords)
-
-        leaf_coords = [_pin_coord(p) for p in leaf_pins]
-
-        # 没有非叶模块 pin ：保持原样
-        if not nonleaf_coords_all or not split_nonleaf_nets:
-            coords = list(leaf_coords) + list(nonleaf_coords_all)
-
-            child_idx = len(child_nets_coords)
-            child_nets_coords.append(coords)
-            orig_to_children[orig_idx] = [child_idx]
-            continue
-
-        # 有非叶模块 pin 且启用拆分：
-        # - 顶层 net：只包含所有非叶模块 pin
-        top_child_idx = len(child_nets_coords)
-        child_nets_coords.append(list(nonleaf_coords_all))
-        children = [top_child_idx]
-
-        # - 底层 net：每个叶模块一个 net：该叶模块的 pin + 其所属非叶模块的 pin
-        #   这里按“每个叶 pin”拆分；所属非叶模块通过层级路径向上找最近的非叶父模块。
-        for pin in leaf_pins:
-            leaf_inst = getattr(pin, "parent_inst", None)
-            parent_nonleaf_inst = _find_parent_nonleaf_inst(db, leaf_inst) if leaf_inst else None
-            parent_nonleaf_coords = nonleaf_pins_by_inst.get(parent_nonleaf_inst, []) if parent_nonleaf_inst else []
-
-            lc = _pin_coord(pin)
-            child_idx = len(child_nets_coords)
-            child_nets_coords.append([lc] + list(parent_nonleaf_coords))
-            children.append(child_idx)
-
-        orig_to_children[orig_idx] = children
-
-    # 输出文本
-    lines = [str(len(child_nets_coords))]
-    for coords in child_nets_coords:
-        line = f"{len(coords)}"
-        for x, y in coords:
-            line += f" {x} {y}"
-        lines.append(line)
+    lines = [str(len(child_edges))]
+    for (x1, y1), (x2, y2) in child_edges:
+        lines.append(f"2 {x1} {y1} {x2} {y2}")
     nets_text = "\n".join(lines)
 
     if return_stats:
         info = {
             "orig_to_children": orig_to_children,
-            "child_net_count": len(child_nets_coords),
+            "child_net_count": len(child_edges),
+            "mode": "strict_successor_edges",
+            "missing_successors": missing_by_orig,
+            "edge_count_by_orig": edge_count_by_orig,
         }
         return nets_text, info
     return nets_text
-
 
 def build_nets_text(
     db: PlaceDB,
@@ -255,7 +436,7 @@ def run_ftpred_for_one_net(
     net,
     ftpred_path: str,
     *,
-    Modules: str | None = None,
+    Modules: Optional[str] = None,
     split_nonleaf_nets: bool = True,
 ) -> float:
     """只跑一个 net，并把聚合后的 feedthrough 回写到该 net 对象的 feedthrough 属性。"""
@@ -384,11 +565,10 @@ def _pack_bin_modules(modules_text: str) -> bytes:
 
 
 def _pack_bin_nets_from_text(nets_text: str) -> bytes:
-    """把 build_nets_text 的文本解析并打包为 NETS payload。"""
+    """把 build_nets_text 的文本解析并打包为 NETS payload。保留兼容。"""
     lines = [ln.strip() for ln in (nets_text or "").splitlines() if ln.strip()]
     if not lines:
-        payload = struct.pack("<B I", 2, 0)
-        return payload
+        return struct.pack("<B I", 2, 0)
     n = int(lines[0])
     payload_parts: list[bytes] = [struct.pack("<B I", 2, n)]
     for i in range(1, 1 + n):
@@ -402,6 +582,21 @@ def _pack_bin_nets_from_text(nets_text: str) -> bytes:
             payload_parts.append(struct.pack("<dd", x, y))
     return b"".join(payload_parts)
 
+
+def _pack_bin_successor_edges(
+    edge_coords: list[tuple[tuple[float, float], tuple[float, float]]]
+) -> bytes:
+    """直接把二端 successor edges 打包为 NETS payload。
+
+    相比旧路径：net -> 文本 Nets -> 解析文本 -> 二进制，
+    这里直接 net -> 二进制，避免重复字符串构造和解析。
+    """
+    payload_parts: list[bytes] = [struct.pack("<B I", 2, len(edge_coords))]
+    for (x1, y1), (x2, y2) in edge_coords:
+        payload_parts.append(struct.pack("<I", 2))
+        payload_parts.append(struct.pack("<dd", float(x1), float(y1)))
+        payload_parts.append(struct.pack("<dd", float(x2), float(y2)))
+    return b"".join(payload_parts)
 
 def _write_frame(w, payload: bytes) -> None:
     w.write(struct.pack("<I", len(payload)))
@@ -429,7 +624,14 @@ def _read_frame(r) -> bytes:
 
 
 class FtpredBinSession:
-    """跨平台二进制帧协议的常驻会话实现（推荐新路径）。"""
+    """跨平台二进制帧协议的常驻会话实现（推荐路径）。
+
+    生命周期应由上层持有，例如 text.py 中的：
+        with FtpredBinSession(ftpred_path, Modules) as sess:
+            sess.run_one_net(...)
+
+    不做 feedthrough 结果缓存；net 坐标变化时每次都会重新发送当前坐标。
+    """
 
     def __init__(self, ftpred_path: str, Modules: str):
         self.ftpred_path = os.path.normpath(ftpred_path)
@@ -445,19 +647,18 @@ class FtpredBinSession:
         if not self._p.stdin or not self._p.stdout:
             raise RuntimeError("Failed to open pipes for ftpred (bin)")
 
-        self._stderr_lines: list[str] = []
+        self._stderr_chunks: list[bytes] = []
         self._stderr_thread = threading.Thread(target=self._drain_stderr_bin, daemon=True)
         self._stderr_thread.start()
 
-        # send MODULES frame
-        mods_payload = _pack_bin_modules(Modules)
-        _write_frame(self._p.stdin, mods_payload)
+        # MODULES 只发送一次；C++ 端会缓存 module grid。
+        _write_frame(self._p.stdin, _pack_bin_modules(Modules))
 
-        # warmup: empty NETS -> expect response frame with n=0
+        # 空 NETS 握手：验证当前 ftpred 支持二进制协议。
         _write_frame(self._p.stdin, struct.pack("<B I", 2, 0))
         resp = _read_frame(self._p.stdout)
         if len(resp) < 4:
-            tail = b"".join(self._stderr_lines[-200:]).decode("utf-8", errors="replace")
+            tail = self._stderr_tail()
             raise RuntimeError(f"Handshake failed (resp too short). stderr tail:\n{tail}")
         (n,) = struct.unpack("<I", resp[:4])
         if n != 0:
@@ -470,76 +671,59 @@ class FtpredBinSession:
             for chunk in iter(lambda: self._p.stderr.read(4096), b""):
                 if not chunk:
                     break
-                self._stderr_lines.append(chunk)
+                self._stderr_chunks.append(chunk)
         except Exception:
             return
 
-    def close(self):
-        if self._p and self._p.stdin:
-            try:
-                _write_frame(self._p.stdin, struct.pack("<B", 3))
-                self._p.stdin.close()
-            except Exception:
-                pass
-        if self._p:
-            try:
-                self._p.wait(timeout=2)
-            except Exception:
-                try:
-                    self._p.kill()
-                except Exception:
-                    pass
+    def _stderr_tail(self, max_bytes: int = 8192) -> str:
+        data = b"".join(self._stderr_chunks[-32:])[-max_bytes:]
+        return data.decode("utf-8", errors="replace")
 
-    def __enter__(self):
-        return self
+    def run_one_net(self, db: PlaceDB, net, *, split_nonleaf_nets: bool = True) -> float:
+        """计算单个 net 的 feedthrough，并写回 net.feedthrough。
 
-    def __exit__(self, exc_type, exc, tb):
-        self.close()
-        return False
-
-    def run_one_net(self, db: PlaceDB, net) -> float:
-        """对单个 net 构建 Nets(文本) -> 转为二进制 -> 发送 -> 解析返回 feedthrough 列表 -> 聚合回写。"""
-        Nets, build_info = build_nets_text(db, net, return_stats=True)
-        nets_payload = _pack_bin_nets_from_text(Nets)
+        内部会把 net 严格展开成若干二端 successor child nets。
+        不使用 net.pins 相邻顺序 fallback。
+        """
+        edge_coords, edge_stats = build_successor_edge_coords(
+            db,
+            net,
+            split_nonleaf_nets=split_nonleaf_nets,
+            return_stats=True,
+        )
+        if edge_stats.get("missing_successors"):
+            setattr(net, "ftpred_missing_successors", edge_stats["missing_successors"])
+        setattr(net, "ftpred_child_edge_count", int(edge_stats.get("edge_count", len(edge_coords))))
+        nets_payload = _pack_bin_successor_edges(edge_coords)
         _write_frame(self._p.stdin, nets_payload)
 
         resp = _read_frame(self._p.stdout)
         if len(resp) < 4:
-            raise RuntimeError("Malformed response frame")
-        (n,) = struct.unpack("<I", resp[:4])
-        expect = int(build_info.get("child_net_count", 0)) if isinstance(build_info, dict) else None
-        if expect is not None and n != expect:
-            # 不强制失败：协议仍可用，但提示不一致
-            pass
+            raise RuntimeError(f"Malformed response frame. stderr tail:\n{self._stderr_tail()}")
 
-        fts: list[float] = []
+        (n,) = struct.unpack("<I", resp[:4])
         off = 4
+        total = 0.0
         for _ in range(n):
             if off + 4 > len(resp):
-                break
+                raise RuntimeError("Malformed response frame: truncated feedthrough array")
             (ft_i,) = struct.unpack("<i", resp[off:off + 4])
-            fts.append(float(ft_i))
+            total += float(ft_i)
             off += 4
 
-        # 复用 assign_feedthrough：构造成文本输出格式
-        out_lines = [f"Net {i} feedthrough = {int(v)}" for i, v in enumerate(fts)]
-        out_text = "\n".join(out_lines) + ("\n" if out_lines else "")
-
-        view = _one_net_view_from_net(db, net)
-        assign_feedthrough(view, out_text, build_info)
-        ft = float(getattr(view.nets_list[0], "feedthrough", 0.0))
-        setattr(net, "feedthrough", ft)
-        return ft
+        # 不做缓存：上层 net 坐标可能反复变化。
+        setattr(net, "feedthrough", total)
+        return total
 
     def close(self):
-        if self._p and self._p.stdin:
+        if getattr(self, "_p", None) and self._p.stdin:
             try:
-                self._p.stdin.write("---QUIT---\n")
-                self._p.stdin.flush()
+                # 二进制协议 QUIT 帧：msgType=3。
+                _write_frame(self._p.stdin, struct.pack("<B", 3))
                 self._p.stdin.close()
             except Exception:
                 pass
-        if self._p:
+        if getattr(self, "_p", None):
             try:
                 self._p.wait(timeout=2)
             except Exception:
@@ -554,7 +738,6 @@ class FtpredBinSession:
     def __exit__(self, exc_type, exc, tb):
         self.close()
         return False
-
 
 def _can_open_ftpred(ftpred_path: str, *, timeout_s: float = 2.0) -> tuple[bool, str]:
     """快速检查 ftpred.exe 是否能启动且一启动就退出（打印 usage 也算）。
@@ -646,7 +829,7 @@ def main():
 
     modules_text = build_modules_text(db)
 
-    nets_text, build_info = build_nets_text(db, args.net)
+    nets_text, build_info = build_nets_text_by_index(db, args.net)
 
     if args.dry_run:
         print(modules_text)

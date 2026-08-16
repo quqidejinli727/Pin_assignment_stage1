@@ -336,12 +336,44 @@ struct TempClearCells {
     }
 };
 
-// 对单个 net 计算 feedthrough：遍历Steiner树中所有边，在网格上扫描，累积“数值变化次数”,feedthrough = (变化次数 / 2)
+// 对二端 successor edge 计算 feedthrough。
+// Python loader 会严格按 pingroup.json 的 parent_inst.pingroup_name -> successors
+// 展开为二端 child net；这里不调用 FLUTE，避免把 successor 图误当成
+// 多端 Steiner net。若两点非同 x/y，取两种 L-shape 中 feedthrough 较小者。
+int feedthroughForTwoPinEdge(const Grid& g, const Net& net) {
+    if (net.pins.size() < 2) return 0;
+
+    const Point& a = net.pins[0];
+    const Point& b = net.pins[1];
+
+    // 同一水平/垂直线：直接扫描单段。
+    if (std::lround(a.x) == std::lround(b.x) || std::lround(a.y) == std::lround(b.y)) {
+        return walkSegmentCountChanges(g, a.x, a.y, b.x, b.y) / 2;
+    }
+
+    // L1: horizontal then vertical, bend=(b.x, a.y)
+    int ch1 = 0;
+    ch1 += walkSegmentCountChanges(g, a.x, a.y, b.x, a.y);
+    ch1 += walkSegmentCountChanges(g, b.x, a.y, b.x, b.y);
+
+    // L2: vertical then horizontal, bend=(a.x, b.y)
+    int ch2 = 0;
+    ch2 += walkSegmentCountChanges(g, a.x, a.y, a.x, b.y);
+    ch2 += walkSegmentCountChanges(g, a.x, b.y, b.x, b.y);
+
+    return std::min(ch1, ch2) / 2;
+}
+
+// 对单个 net 计算 feedthrough。
+// 当前 Python loader 会把 pingroup successor 图严格展开成多个 2-pin child nets；
+// 因此常见路径会直接走 feedthroughForTwoPinEdge，避免大 net 调用 FLUTE。
+// d>2 仍保留原 FLUTE fallback，以兼容旧文本输入或调试输入。
 int feedthroughForNet(const Grid& g, const Net& net) {
     using namespace Flute;
 
     int d = static_cast<int>(net.pins.size());
     if (d < 2) return 0;
+    if (d == 2) return feedthroughForTwoPinEdge(g, net);
 
     std::vector<DTYPE> xs(d), ys(d);
     for (int i = 0; i < d; ++i) {
