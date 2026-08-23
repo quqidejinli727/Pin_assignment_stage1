@@ -95,6 +95,78 @@ def write_case(tmp_path: Path) -> tuple[Path, Path]:
     return block_path, pingroup_path
 
 
+def write_deferred_reward_case(tmp_path: Path) -> tuple[Path, Path]:
+    """Create A-B where B has a second pin outside A's local net."""
+    block = {
+        "name": "TOP",
+        "module_name": "TOP",
+        "direction": 0,
+        "color": "#000000",
+        "vertex": [[0, 0], [200, 0], [200, 40], [0, 40]],
+        "children": [
+            {
+                "name": "TOP.U_A0",
+                "module_name": "A",
+                "direction": 0,
+                "color": "#aaaaaa",
+                "vertex": [[0, 0], [100, 0], [100, 10], [0, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_B0",
+                "module_name": "B",
+                "direction": 0,
+                "color": "#bbbbbb",
+                "vertex": [[110, 0], [120, 0], [120, 10], [110, 10]],
+                "children": [],
+            },
+            {
+                "name": "TOP.U_B1",
+                "module_name": "B",
+                "direction": 0,
+                "color": "#bbbbbb",
+                "vertex": [[150, 0], [160, 0], [160, 10], [150, 10]],
+                "children": [],
+            },
+        ],
+    }
+    pingroup = [
+        [
+            {
+                "parent_inst": "TOP.U_A0",
+                "parent_module": "A",
+                "pingroup_name": "p",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+            {
+                "parent_inst": "TOP.U_B0",
+                "parent_module": "B",
+                "pingroup_name": "q",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            },
+        ],
+        [
+            {
+                "parent_inst": "TOP.U_B1",
+                "parent_module": "B",
+                "pingroup_name": "q",
+                "scope": [],
+                "successors": [],
+                "width": 1.0,
+            }
+        ],
+    ]
+    block_path = tmp_path / "deferred_block.json"
+    pingroup_path = tmp_path / "deferred_pingroup.json"
+    block_path.write_text(json.dumps(block), encoding="utf-8")
+    pingroup_path.write_text(json.dumps(pingroup), encoding="utf-8")
+    return block_path, pingroup_path
+
+
 def test_vertex_alignment_handles_cyclic_start():
     """Test helper."""
     reference = [[0, 0], [20, 0], [20, 10], [0, 10]]
@@ -257,23 +329,28 @@ def test_fanout_reuse_sorting_can_be_disabled(tmp_path):
     assert ordinary_homology.unassigned_groups()[0].name == "B.p"
 
 
-def test_reward_true_skip_removes_pin_from_hpwl(tmp_path):
-    """Skipped pins are removed from reward metrics instead of using virtual locations."""
+def test_reward_permanent_exclusion_removes_pin_from_hpwl(tmp_path):
+    """Only explicitly invalid pins are removed from physical reward metrics."""
     block_path, pingroup_path = write_case(tmp_path)
     placedb = PlaceDB(str(block_path), str(pingroup_path))
     net = placedb.nets_list[0]
-    skipped = {"TOP.U_B0.q"}
+    excluded = {"TOP.U_B0.q"}
 
     assigned_b_location = {"TOP.U_B0.q": (1000.0, 1000.0)}
     assert net_hpwl(net, placedb, assigned_b_location) > 0.0
-    assert net_hpwl(net, placedb, assigned_b_location, skipped) == 0.0
+    assert net_hpwl(
+        net,
+        placedb,
+        assigned_b_location,
+        excluded_pin_names=excluded,
+    ) == 0.0
 
     evaluator = RewardEvaluator(
         [net],
         placedb,
         wirelength_weight=1.0,
         feedthrough_weight=0.0,
-        skipped_pin_names=skipped,
+        excluded_pin_names=excluded,
     )
     try:
         assert evaluator.metric_nets == []
@@ -282,14 +359,14 @@ def test_reward_true_skip_removes_pin_from_hpwl(tmp_path):
         evaluator.close()
 
 
-def test_mcts_skip_groups_do_not_inflate_search_profile(tmp_path):
-    """Skip-only groups should not count as effective MCTS depth or emit locations."""
+def test_mcts_deferred_groups_do_not_inflate_search_profile(tmp_path):
+    """Deferred groups do not add actions but remain physical reward endpoints."""
     block_path, pingroup_path = write_case(tmp_path)
     placedb = PlaceDB(str(block_path), str(pingroup_path))
     segments = SegmentManager(placedb)
     homology = HomologyManager(placedb)
     groups = homology.unassigned_groups()
-    skipped_names = {groups[0].name}
+    deferred_names = {groups[0].name}
 
     mcts = MCTSSolver(
         placedb,
@@ -299,7 +376,7 @@ def test_mcts_skip_groups_do_not_inflate_search_profile(tmp_path):
         simulations=4,
         search_mode="basic",
         feedthrough_weight=0.0,
-        skipped_group_names=skipped_names,
+        deferred_group_names=deferred_names,
     )
     profile = mcts._search_profile(segments.snapshot_usage())
     assert profile.depth == len(groups) - 1
@@ -307,10 +384,88 @@ def test_mcts_skip_groups_do_not_inflate_search_profile(tmp_path):
     assignments = {groups[0].name: "__SKIP_UNCOVERED_GROUP__"}
     locations = mcts._temporary_locations(assignments)
     assert all(pin.full_name not in locations for pin in groups[0].pins)
+    assert mcts.excluded_pin_names == set()
 
 
-def test_solver_true_skip_excludes_groups_from_mcts_tree(tmp_path):
-    """True-skip groups should not be passed into the current MCTS tree."""
+def test_deferred_endpoint_guides_reward_and_candidate_pruning(tmp_path):
+    """Deferred B stays in A-B HPWL without becoming an action or proposal."""
+    block_path, pingroup_path = write_deferred_reward_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group_a = homology.pin_groups["A.p"]
+    group_b = homology.pin_groups["B.q"]
+    net = placedb.nets_list[0]
+    pin_a = group_a.pins[0]
+    pin_b = next(pin for pin in group_b.pins if pin.parent_inst == "TOP.U_B0")
+    candidates = segments.candidates_for_module(group_a.module_name)
+    near = max(candidates, key=lambda item: item.instances[pin_a.parent_inst].midpoint[0])
+    far = min(candidates, key=lambda item: item.instances[pin_a.parent_inst].midpoint[0])
+    near_locations = {pin_a.full_name: near.instances[pin_a.parent_inst].midpoint}
+    far_locations = {pin_a.full_name: far.instances[pin_a.parent_inst].midpoint}
+
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group_a],
+        [net],
+        simulations=8,
+        search_mode="basic",
+        feedthrough_weight=0.0,
+        deferred_group_names={group_b.name},
+    )
+
+    assert [group.name for group in mcts.groups] == [group_a.name]
+    assert placedb.get_pin_location_estimate(pin_b) == (115.0, 5.0)
+    assert net_hpwl(net, placedb, near_locations) < net_hpwl(
+        net, placedb, far_locations
+    )
+    assert mcts.reward_evaluator.evaluate(near_locations) > (
+        mcts.reward_evaluator.evaluate(far_locations)
+    )
+    assert mcts._candidate_pruning_score(group_a, near) > (
+        mcts._candidate_pruning_score(group_a, far)
+    )
+    proposal = mcts.search()
+    assert group_a.name in proposal
+    assert group_b.name not in proposal
+    assert mcts.reward_evaluator.metric_nets == [net]
+    assert mcts.reward_evaluator.skipped_single_pin_net_count == 0
+
+
+def test_tree_external_assigned_endpoint_uses_segment_midpoint(tmp_path):
+    """An already assigned non-action endpoint uses its committed real location."""
+    block_path, pingroup_path = write_deferred_reward_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group_a = homology.pin_groups["A.p"]
+    group_b = homology.pin_groups["B.q"]
+    pin_b = next(pin for pin in group_b.pins if pin.parent_inst == "TOP.U_B0")
+    segment_b = max(
+        segments.candidates_for_module(group_b.module_name),
+        key=lambda item: item.instances[pin_b.parent_inst].midpoint[0],
+    )
+    segments.apply_assignment(group_b.name, group_b.pins, segment_b.segment_id)
+    homology.mark_assigned(group_b, segment_b.segment_id)
+
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group_a],
+        [placedb.nets_list[0]],
+        simulations=2,
+        feedthrough_weight=0.0,
+        deferred_group_names={group_b.name},
+    )
+    base = mcts.reward_evaluator._net_base_locations[id(placedb.nets_list[0])]
+    assert base[pin_b.full_name] == segment_b.instances[pin_b.parent_inst].midpoint
+    assert base[pin_b.full_name] == placedb.get_pin_location_estimate(pin_b)
+    assert base[pin_b.full_name] != placedb.get_module(pin_b.parent_inst).get_centroid()
+
+
+def test_solver_deferred_group_is_not_committed_then_can_seed_later(tmp_path):
+    """Deferred groups leave one tree's decisions and remain assignable later."""
     block = {
         "name": "TOP",
         "module_name": "TOP",
@@ -384,8 +539,8 @@ def test_solver_true_skip_excludes_groups_from_mcts_tree(tmp_path):
     class FakeMCTS:
         def __init__(self, *args, **kwargs):
             self.groups = kwargs["groups"]
-            self.skipped_group_names = set(kwargs.get("skipped_group_names", set()))
-            self.skipped_pin_names = set(kwargs.get("skipped_pin_names", set()))
+            self.deferred_group_names = set(kwargs.get("deferred_group_names", set()))
+            self.excluded_pin_names = set(kwargs.get("excluded_pin_names", set()))
             self.last_simulation_count = 0
             self.timing_profile = {}
             self.reward_evaluator = type("FakeReward", (), {"timing_profile": {}})()
@@ -405,14 +560,19 @@ def test_solver_true_skip_excludes_groups_from_mcts_tree(tmp_path):
             homology_group_commit_coverage_threshold=1.0,
             feedthrough_weight=0.0,
         )
-        solver.solve()
+        result = solver.solve()
     finally:
         assignment_solver_module.MCTSSolver = original_mcts
 
     first_call = calls[0]
     assert [group.name for group in first_call.groups] == ["S.seed"]
-    assert first_call.skipped_group_names == {"T.partial"}
-    assert first_call.skipped_pin_names == {"TOP.U_T0.partial", "TOP.U_T1.partial"}
+    assert first_call.deferred_group_names == {"T.partial"}
+    assert first_call.excluded_pin_names == set()
+    assert any(
+        "T.partial" in {group.name for group in call.groups}
+        for call in calls[1:]
+    )
+    assert result["summary"]["unassigned_group_count"] == 0
 
 
 def test_assignment_progress_no_longer_emits_periodic_log(tmp_path):
@@ -803,8 +963,8 @@ def test_batch_analysis_does_not_skip_low_committable_trees(tmp_path):
     assert report["tree_reports"][0]["committable_group_ratio_of_search_groups"] == 0.25
 
 
-def test_batch_analysis_true_skip_uses_effective_mcts_depth(tmp_path):
-    """True-skip groups should be raw candidates but not effective MCTS depth."""
+def test_batch_analysis_deferred_groups_only_reduce_decision_depth(tmp_path):
+    """Deferred groups reduce tree depth without reducing physical net pins."""
     block_path, pingroup_path = write_low_committable_case(tmp_path)
 
     report = analyze_batches(
@@ -821,9 +981,11 @@ def test_batch_analysis_true_skip_uses_effective_mcts_depth(tmp_path):
     assert first_tree["raw_committable_group_count"] == 4
     assert first_tree["committable_group_count"] == 1
     assert first_tree["true_skipped_group_count"] == 3
+    assert first_tree["deferred_from_search_group_count"] == 3
     assert first_tree["raw_search_pin_count"] == 8
     assert first_tree["search_pin_count"] == 2
     assert report["summary"]["true_skipped_group_visits"] == 6
+    assert report["summary"]["deferred_from_search_group_visits"] == 6
     assert report["summary"]["total_mcts_search_group_visits"] == 4
 
 
@@ -1518,16 +1680,16 @@ def test_cached_candidate_hpwl_matches_generic_net_hpwl(tmp_path):
             locations,
         )
 
-    skipped = {net.pins[1].full_name}
-    skipped_evaluator = RewardEvaluator(
+    excluded = {net.pins[1].full_name}
+    excluded_evaluator = RewardEvaluator(
         [net],
         placedb,
         feedthrough_weight=0.0,
         enable_feedthrough=False,
-        skipped_pin_names=skipped,
+        excluded_pin_names=excluded,
     )
-    assert skipped_evaluator.metric_nets == []
-    assert net_hpwl(net, placedb, {}, skipped) == 0.0
+    assert excluded_evaluator.metric_nets == []
+    assert net_hpwl(net, placedb, {}, excluded_pin_names=excluded) == 0.0
     assert evaluator.hpwl_profile["candidate_calls"] == 3
     assert evaluator.hpwl_profile["candidate_pin_visits"] == 3 * len(net.pins)
 
@@ -1540,11 +1702,119 @@ class FakeFeedthroughContext:
         self.closed = False
 
     def run_one_net_at_locations(self, net, locations):
-        self.calls.append((net.net_id, tuple(sorted(locations))))
+        self.calls.append(
+            {
+                "net_id": net.net_id,
+                "pin_names": tuple(pin.full_name for pin in net.pins),
+                "locations": dict(locations),
+            }
+        )
         return 0.0
 
     def close(self):
         self.closed = True
+
+
+def test_feedthrough_keeps_deferred_endpoint_and_base_location(tmp_path):
+    """FT receives every local-net pin and the deferred pin's module center."""
+    block_path, pingroup_path = write_deferred_reward_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group_a = homology.pin_groups["A.p"]
+    group_b = homology.pin_groups["B.q"]
+    net = placedb.nets_list[0]
+    pin_a = group_a.pins[0]
+    pin_b = next(pin for pin in group_b.pins if pin.parent_inst == "TOP.U_B0")
+    near = max(
+        segments.candidates_for_module(group_a.module_name),
+        key=lambda item: item.instances[pin_a.parent_inst].midpoint[0],
+    )
+    context = FakeFeedthroughContext()
+    mcts = MCTSSolver(
+        placedb,
+        segments,
+        [group_a],
+        [net],
+        simulations=2,
+        feedthrough_weight=1.0,
+        enable_feedthrough=True,
+        feedthrough_context=context,
+        deferred_group_names={group_b.name},
+    )
+    candidate_a = near.instances[pin_a.parent_inst].midpoint
+    mcts.reward_evaluator.evaluate({pin_a.full_name: candidate_a})
+    candidate_call = context.calls[-1]
+
+    assert set(candidate_call["pin_names"]) == {pin_a.full_name, pin_b.full_name}
+    assert set(candidate_call["locations"]) == {pin_a.full_name, pin_b.full_name}
+    assert candidate_call["locations"][pin_a.full_name] == candidate_a
+    assert candidate_call["locations"][pin_b.full_name] == (115.0, 5.0)
+    assert mcts.reward_evaluator.skipped_single_pin_net_count == 0
+
+
+def test_feedthrough_cache_key_tracks_deferred_endpoint_base_location(tmp_path):
+    """A later real assignment cannot reuse FT cached at the module center."""
+    block_path, pingroup_path = write_deferred_reward_case(tmp_path)
+    placedb = PlaceDB(str(block_path), str(pingroup_path))
+    segments = SegmentManager(placedb)
+    homology = HomologyManager(placedb)
+    group_a = homology.pin_groups["A.p"]
+    group_b = homology.pin_groups["B.q"]
+    net = placedb.nets_list[0]
+    pin_a = group_a.pins[0]
+    pin_b = next(pin for pin in group_b.pins if pin.parent_inst == "TOP.U_B0")
+    candidate_a = segments.candidates_for_module(group_a.module_name)[0].instances[
+        pin_a.parent_inst
+    ].midpoint
+
+    class RecordingCachedContext:
+        def __init__(self):
+            self.calls = []
+
+        def run_one_net_at_locations_cached(self, candidate_net, key, locations_factory):
+            self.calls.append((key, locations_factory()))
+            return 0.0
+
+    context = RecordingCachedContext()
+    before = MCTSSolver(
+        placedb,
+        segments,
+        [group_a],
+        [net],
+        simulations=2,
+        feedthrough_weight=1.0,
+        enable_feedthrough=True,
+        feedthrough_context=context,
+        deferred_group_names={group_b.name},
+    )
+    before.reward_evaluator.evaluate({pin_a.full_name: candidate_a})
+    before_key, before_locations = context.calls[-1]
+    assert before_locations[pin_b.full_name] == (115.0, 5.0)
+
+    segment_b = max(
+        segments.candidates_for_module(group_b.module_name),
+        key=lambda item: item.instances[pin_b.parent_inst].midpoint[0],
+    )
+    segments.apply_assignment(group_b.name, group_b.pins, segment_b.segment_id)
+    after = MCTSSolver(
+        placedb,
+        segments,
+        [group_a],
+        [net],
+        simulations=2,
+        feedthrough_weight=1.0,
+        enable_feedthrough=True,
+        feedthrough_context=context,
+        deferred_group_names={group_b.name},
+    )
+    after.reward_evaluator.evaluate({pin_a.full_name: candidate_a})
+    after_key, after_locations = context.calls[-1]
+
+    assert after_locations[pin_b.full_name] == segment_b.instances[
+        pin_b.parent_inst
+    ].midpoint
+    assert before_key != after_key
 
 
 def test_reward_evaluator_uses_shared_feedthrough_context(tmp_path):

@@ -124,6 +124,7 @@ class AssignmentSolver:
         self.auto_build_feedthrough = auto_build_feedthrough
         self.cmake_generator = cmake_generator
         self.feedthrough_context: FeedthroughContext | None = None
+        self.trace_feedthrough_enabled = False
         self.homology_skip_uncovered_groups = homology_skip_uncovered_groups
         self.homology_skip_coverage_threshold = homology_skip_coverage_threshold
         self.homology_group_commit_coverage_threshold = homology_group_commit_coverage_threshold
@@ -177,6 +178,17 @@ class AssignmentSolver:
         self.assignment_progress_pin_count = 0
         self.assigned_group_count = 0
         self.total_mcts_simulations = 0
+        # Search diagnostics are intentionally solver-local and do not affect
+        # the assignment path.  They let serial runs expose the same FT
+        # reward/caching counters as the parallel worker reports.
+        self.mcts_reward_feedthrough_seconds = 0.0
+        self.mcts_reward_feedthrough_eval_seconds = 0.0
+        self.mcts_reward_feedthrough_location_seconds = 0.0
+        self.mcts_feedthrough_cache_hits = 0
+        self.mcts_feedthrough_cache_misses = 0
+        self.mcts_feedthrough_batch_calls = 0
+        self.mcts_feedthrough_batch_requests = 0
+        self.mcts_feedthrough_batch_misses = 0
         self.stage1_start_time = stage1_start_time
         self.first_mcts_search_logged = False
         self.searched_pingroup_names: Set[str] = set()
@@ -233,27 +245,21 @@ class AssignmentSolver:
 
                 pin_full_names = {pin.full_name for pin in pins_in}
                 skip_started = time.perf_counter()
-                committable_groups, skipped_group_names = self._classify_groups_by_coverage(
+                committable_groups, deferred_group_names = self._classify_groups_by_coverage(
                     related_groups,
                     pin_full_names,
                     self.homology_group_commit_coverage_threshold,
                     self.homology_skip_coverage_threshold,
                 )
                 if not self.homology_skip_uncovered_groups:
-                    skipped_group_names = set()
+                    deferred_group_names = set()
                 skip_elapsed = time.perf_counter() - skip_started
                 search_groups = [
-                    group for group in related_groups if group.name not in skipped_group_names
+                    group for group in related_groups if group.name not in deferred_group_names
                 ]
                 effective_committable_groups = [
-                    group for group in committable_groups if group.name not in skipped_group_names
+                    group for group in committable_groups if group.name not in deferred_group_names
                 ]
-                skipped_pin_names = {
-                    pin.full_name
-                    for group in related_groups
-                    if group.name in skipped_group_names
-                    for pin in group.pins
-                }
                 if not search_groups:
                     self.assignment_rounds += 1
                     continue
@@ -273,8 +279,8 @@ class AssignmentSolver:
                     simulations=budget,
                     random_seed=self.random_seed + self.assignment_rounds,
                     feedthrough_context=self.feedthrough_context,
-                    skipped_group_names=skipped_group_names,
-                    skipped_pin_names=skipped_pin_names,
+                    deferred_group_names=deferred_group_names,
+                    excluded_pin_names=set(),
                     **self.mcts_options,
                 )
                 search_started = time.perf_counter()
@@ -286,6 +292,36 @@ class AssignmentSolver:
                 proposed_assignment = mcts.search()
                 search_elapsed = time.perf_counter() - search_started
                 self.total_mcts_simulations += getattr(mcts, "last_simulation_count", 0)
+                reward_profile = getattr(
+                    getattr(mcts, "reward_evaluator", None),
+                    "timing_profile",
+                    {},
+                )
+                self.mcts_reward_feedthrough_seconds += float(
+                    reward_profile.get("reward_feedthrough", 0.0)
+                )
+                self.mcts_reward_feedthrough_eval_seconds += float(
+                    reward_profile.get("reward_feedthrough_eval", 0.0)
+                )
+                self.mcts_reward_feedthrough_location_seconds += float(
+                    reward_profile.get("reward_feedthrough_location", 0.0)
+                )
+                if self.feedthrough_context is not None:
+                    self.mcts_feedthrough_cache_hits = int(
+                        getattr(self.feedthrough_context, "cache_hits", 0)
+                    )
+                    self.mcts_feedthrough_cache_misses = int(
+                        getattr(self.feedthrough_context, "cache_misses", 0)
+                    )
+                    self.mcts_feedthrough_batch_calls = int(
+                        getattr(self.feedthrough_context, "batch_calls", 0)
+                    )
+                    self.mcts_feedthrough_batch_requests = int(
+                        getattr(self.feedthrough_context, "batch_request_count", 0)
+                    )
+                    self.mcts_feedthrough_batch_misses = int(
+                        getattr(self.feedthrough_context, "batch_miss_count", 0)
+                    )
                 commit_started = time.perf_counter()
                 committed_count = self._commit_contained_groups(
                     effective_committable_groups,
@@ -303,7 +339,7 @@ class AssignmentSolver:
                     related_group_count=len(related_groups),
                     search_group_count=len(search_groups),
                     committable_group_count=len(effective_committable_groups),
-                    skipped_group_count=len(skipped_group_names),
+                    deferred_group_count=len(deferred_group_names),
                     prior_assigned_group_count=prior_assigned_group_count,
                     committed_count=committed_count,
                 )
@@ -337,6 +373,7 @@ class AssignmentSolver:
             auto_build_feedthrough=self.auto_build_feedthrough,
             cmake_generator=self.cmake_generator,
             role=role,
+            trace_enabled=self.trace_feedthrough_enabled,
         )
 
     def _feedthrough_reward_context_source(self) -> tuple[Path | None, str]:
@@ -431,11 +468,11 @@ class AssignmentSolver:
         commit_coverage_threshold: float,
         skip_coverage_threshold: float,
     ) -> tuple[List[PinHomologyGroup], Set[str]]:
-        """Classify committable and true-skip groups in one coverage pass."""
+        """Classify committable and current-tree deferred groups in one pass."""
         commit_threshold = max(0.0, min(1.0, commit_coverage_threshold))
         skip_threshold = max(0.0, min(1.0, skip_coverage_threshold))
         committable: List[PinHomologyGroup] = []
-        skipped: Set[str] = set()
+        deferred: Set[str] = set()
         for group in related_groups:
             if not group.pins:
                 continue
@@ -444,8 +481,8 @@ class AssignmentSolver:
             if coverage_ratio >= commit_threshold:
                 committable.append(group)
             if coverage_ratio < skip_threshold:
-                skipped.add(group.name)
-        return committable, skipped
+                deferred.add(group.name)
+        return committable, deferred
 
     def _committable_groups(
         self,
@@ -619,7 +656,7 @@ class AssignmentSolver:
         related_group_count: int,
         search_group_count: int,
         committable_group_count: int,
-        skipped_group_count: int,
+        deferred_group_count: int,
         prior_assigned_group_count: int,
         committed_count: int,
     ) -> None:
@@ -641,7 +678,7 @@ class AssignmentSolver:
             "mcts_tree round=%d time=%s seed_group=%s "
             "pre_first_mcts_s=%.6f tree_build_s=%.6f search_wall_s=%.6f "
             "related_groups=%d search_groups=%d committable_groups=%d "
-            "skipped_groups=%d prior_assigned_groups=%d committed_groups=%d "
+            "deferred_groups=%d prior_assigned_groups=%d committed_groups=%d "
             "simulations=%d mcts_main_s=%.6f reward_total_s=%.6f "
             "reward_hpwl_s=%.6f reward_hpwl_reference_s=%.6f reward_ft_s=%.6f "
             "select_s=%.6f expand_s=%.6f child_generation_s=%.6f "
@@ -668,7 +705,7 @@ class AssignmentSolver:
             related_group_count,
             search_group_count,
             committable_group_count,
-            skipped_group_count,
+            deferred_group_count,
             prior_assigned_group_count,
             committed_count,
             getattr(mcts, "last_simulation_count", 0),
@@ -779,4 +816,3 @@ class AssignmentSolver:
             return result
         finally:
             self.close_feedthrough_context()
-

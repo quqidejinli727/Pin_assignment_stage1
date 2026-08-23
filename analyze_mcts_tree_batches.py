@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Dict, Iterable, List
 
 from PlaceDB import Net, Pin, PlaceDB
-from config import DEFAULT_CONFIG
 from homology import HomologyManager, PinHomologyGroup
 
 
@@ -44,8 +43,29 @@ def _group_records(groups: Iterable[PinHomologyGroup]) -> List[dict]:
     ]
 
 
+def _include_tree_details() -> bool:
+    return False
+
+
 def _ratio(numerator: int, denominator: int) -> float:
     return numerator / denominator if denominator else 0.0
+
+
+def _net_active_pin_count(net: Net, excluded_pin_names: set[str]) -> int:
+    """Count physical endpoints, excluding only permanently invalid pins."""
+    return sum(1 for pin in net.pins if pin.full_name not in excluded_pin_names)
+
+
+def _net_pin_count_bucket(pin_count: int) -> str:
+    if pin_count <= 20:
+        return str(pin_count)
+    lower = ((pin_count - 1) // 100) * 100 + 1
+    upper = lower + 99
+    return f"{lower}-{upper}"
+
+
+def _increment_histogram(histogram: Dict[str, int], key: str, amount: int = 1) -> None:
+    histogram[key] = histogram.get(key, 0) + amount
 
 
 def _committable_groups(
@@ -64,29 +84,30 @@ def _committable_groups(
     return committable
 
 
-def _uncovered_group_names(
+def _deferred_group_names(
     groups: Iterable[PinHomologyGroup],
     pin_full_names: set[str],
     coverage_threshold: float,
 ) -> set[str]:
     threshold = max(0.0, min(1.0, coverage_threshold))
-    skipped = set()
+    deferred = set()
     for group in groups:
         if not group.pins:
             continue
         covered_count = sum(1 for pin in group.pins if pin.full_name in pin_full_names)
         if _ratio(covered_count, len(group.pins)) < threshold:
-            skipped.add(group.name)
-    return skipped
+            deferred.add(group.name)
+    return deferred
 
 
 def analyze_batches(
     block_json: str | Path,
     pingroup_json: str | Path,
-    coverage_threshold: float = DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
-    use_fanout_reuse_for_sorting: bool = DEFAULT_CONFIG.homology_use_fanout_reuse_for_sorting,
-    skip_uncovered_groups: bool = DEFAULT_CONFIG.homology_skip_uncovered_groups,
-    skip_coverage_threshold: float = DEFAULT_CONFIG.homology_skip_coverage_threshold,
+    coverage_threshold: float = 1.0,
+    use_fanout_reuse_for_sorting: bool = False,
+    skip_uncovered_groups: bool = True,
+    skip_coverage_threshold: float = 1.0,
+    include_tree_details: bool = False,
 ) -> dict:
     placedb = PlaceDB(str(block_json), str(pingroup_json))
     homology = HomologyManager(
@@ -96,6 +117,9 @@ def analyze_batches(
 
     tree_reports: List[dict] = []
     non_mcts_assignments: List[dict] = []
+    reward_net_pin_count_histogram: Dict[str, int] = {}
+    reward_net_pin_count_total_by_bucket: Dict[str, int] = {}
+    skipped_metric_net_visits = 0
     tree_index = 0
     candidate_tree_index = 0
 
@@ -142,8 +166,8 @@ def analyze_batches(
                 pin_full_names,
                 coverage_threshold,
             )
-            skipped_group_names = (
-                _uncovered_group_names(
+            deferred_group_names = (
+                _deferred_group_names(
                     related_groups,
                     pin_full_names,
                     skip_coverage_threshold,
@@ -152,18 +176,37 @@ def analyze_batches(
                 else set()
             )
             effective_search_groups = [
-                group for group in related_groups if group.name not in skipped_group_names
+                group for group in related_groups if group.name not in deferred_group_names
             ]
             effective_committable_groups = [
-                group for group in committable_groups if group.name not in skipped_group_names
+                group for group in committable_groups if group.name not in deferred_group_names
             ]
             committable_group_names = {group.name for group in committable_groups}
             deferred_groups = [
                 group for group in related_groups if group.name not in committable_group_names
             ]
-            skipped_groups = [
-                group for group in related_groups if group.name in skipped_group_names
+            deferred_from_search_groups = [
+                group for group in related_groups if group.name in deferred_group_names
             ]
+            # This analyzer configures no permanent physical exclusions.
+            # Deferred groups therefore remain endpoints of their local nets.
+            excluded_pin_names: set[str] = set()
+            reward_net_count = 0
+            reward_net_bucket_counts: Dict[str, int] = {}
+            for net in nets:
+                active_pin_count = _net_active_pin_count(net, excluded_pin_names)
+                if active_pin_count <= 1:
+                    skipped_metric_net_visits += 1
+                    continue
+                bucket = _net_pin_count_bucket(active_pin_count)
+                _increment_histogram(reward_net_pin_count_histogram, bucket)
+                _increment_histogram(
+                    reward_net_pin_count_total_by_bucket,
+                    bucket,
+                    active_pin_count,
+                )
+                _increment_histogram(reward_net_bucket_counts, bucket)
+                reward_net_count += 1
 
             raw_search_group_count = len(related_groups)
             raw_search_pin_count = _group_pin_count(related_groups)
@@ -183,7 +226,10 @@ def analyze_batches(
                 "tree_index": tree_index,
                 "seed_group": seed_group.name,
                 "related_net_count": len(nets),
-                "related_net_ids": [net.net_id for net in nets],
+                "reward_net_count": reward_net_count,
+                "reward_net_pin_count_buckets": dict(
+                    sorted(reward_net_bucket_counts.items(), key=lambda item: _bucket_sort_key(item[0]))
+                ),
                 "pins_in_count": pins_in_count,
                 "mcts_depth": search_group_count,
                 "raw_mcts_depth": raw_search_group_count,
@@ -191,8 +237,16 @@ def analyze_batches(
                 "search_pin_count": search_pin_count,
                 "raw_search_group_count": raw_search_group_count,
                 "raw_search_pin_count": raw_search_pin_count,
-                "true_skipped_group_count": len(skipped_groups),
-                "true_skipped_pin_count": _group_pin_count(skipped_groups),
+                "deferred_from_search_group_count": len(deferred_from_search_groups),
+                "deferred_from_search_pin_count": _group_pin_count(
+                    deferred_from_search_groups
+                ),
+                # Compatibility keys for existing reports.  These groups are
+                # deferred decisions, not removed physical endpoints.
+                "true_skipped_group_count": len(deferred_from_search_groups),
+                "true_skipped_pin_count": _group_pin_count(
+                    deferred_from_search_groups
+                ),
                 "committable_group_count": len(effective_committable_groups),
                 "committable_pin_count": committable_pin_count,
                 "raw_committable_group_count": len(committable_groups),
@@ -211,13 +265,24 @@ def analyze_batches(
                 ),
                 "deferred_group_count": len(deferred_groups),
                 "deferred_pin_count": _group_pin_count(deferred_groups),
-                "search_groups": _group_records(effective_search_groups),
-                "raw_search_groups": _group_records(related_groups),
-                "committable_groups": _group_records(effective_committable_groups),
-                "raw_committable_groups": _group_records(committable_groups),
-                "deferred_groups": _group_records(deferred_groups),
-                "true_skipped_groups": _group_records(skipped_groups),
             }
+            if include_tree_details or _include_tree_details():
+                report.update(
+                    {
+                        "related_net_ids": [net.net_id for net in nets],
+                        "search_groups": _group_records(effective_search_groups),
+                        "raw_search_groups": _group_records(related_groups),
+                        "committable_groups": _group_records(effective_committable_groups),
+                        "raw_committable_groups": _group_records(committable_groups),
+                        "deferred_groups": _group_records(deferred_groups),
+                        "deferred_from_search_groups": _group_records(
+                            deferred_from_search_groups
+                        ),
+                        "true_skipped_groups": _group_records(
+                            deferred_from_search_groups
+                        ),
+                    }
+                )
 
             tree_reports.append(report)
             current_tree_index = tree_index
@@ -242,6 +307,8 @@ def analyze_batches(
     final_greedy_pin_count = _group_pin_count(final_greedy_groups)
     total_search_pin_count = sum(search_pin_values)
     total_committable_pin_count = sum(committable_pin_values)
+    related_net_count_values = [report["related_net_count"] for report in tree_reports]
+    reward_net_count_values = [report["reward_net_count"] for report in tree_reports]
     return {
         "input": {
             "block_json": str(Path(block_json)),
@@ -252,6 +319,7 @@ def analyze_batches(
             "coverage_threshold": coverage_threshold,
             "skip_uncovered_groups": skip_uncovered_groups,
             "skip_coverage_threshold": skip_coverage_threshold,
+            "include_tree_details": include_tree_details,
         },
         "summary": {
             "total_homology_group_count": len(homology.pin_groups),
@@ -274,6 +342,12 @@ def analyze_batches(
             "true_skipped_pin_visits": sum(
                 report["true_skipped_pin_count"] for report in tree_reports
             ),
+            "deferred_from_search_group_visits": sum(
+                report["deferred_from_search_group_count"] for report in tree_reports
+            ),
+            "deferred_from_search_pin_visits": sum(
+                report["deferred_from_search_pin_count"] for report in tree_reports
+            ),
             "final_greedy_group_count": len(final_greedy_groups),
             "final_greedy_pin_count": final_greedy_pin_count,
             "non_mcts_assignment_count": len(non_mcts_assignments),
@@ -281,12 +355,33 @@ def analyze_batches(
             "max_mcts_depth": max(depth_values, default=0),
             "min_mcts_depth": min(depth_values, default=0),
             "average_mcts_depth": _ratio(sum(depth_values), len(depth_values)),
+            "max_related_net_count_per_tree": max(related_net_count_values, default=0),
+            "average_related_net_count_per_tree": _ratio(
+                sum(related_net_count_values),
+                len(related_net_count_values),
+            ),
+            "total_reward_net_visits": sum(reward_net_count_values),
+            "skipped_metric_net_visits": skipped_metric_net_visits,
             "average_tree_committable_pin_ratio": _ratio(
                 sum(report["committable_pin_ratio_of_search_pins"] for report in tree_reports),
                 len(tree_reports),
             ),
         },
-        "depth_histogram": _histogram(depth_values),
+        "depth_histogram": _depth_histogram(depth_values),
+        "related_net_count_histogram": _histogram(related_net_count_values),
+        "reward_net_count_histogram": _histogram(reward_net_count_values),
+        "reward_net_active_pin_count_histogram": dict(
+            sorted(
+                reward_net_pin_count_histogram.items(),
+                key=lambda item: _bucket_sort_key(item[0]),
+            )
+        ),
+        "reward_net_active_pin_total_by_bucket": dict(
+            sorted(
+                reward_net_pin_count_total_by_bucket.items(),
+                key=lambda item: _bucket_sort_key(item[0]),
+            )
+        ),
         "tree_reports": tree_reports,
         "non_mcts_assignments": non_mcts_assignments,
         "final_greedy_groups": _group_records(final_greedy_groups),
@@ -299,6 +394,23 @@ def _histogram(values: Iterable[int]) -> dict:
         key = str(value)
         histogram[key] = histogram.get(key, 0) + 1
     return dict(sorted(histogram.items(), key=lambda item: int(item[0])))
+
+
+def _depth_histogram(values: Iterable[int]) -> dict:
+    histogram: Dict[str, int] = {}
+    for value in values:
+        if value <= 20:
+            key = str(value)
+        else:
+            lower = ((value - 21) // 20) * 20 + 21
+            upper = lower + 19
+            key = f"{lower}-{upper}"
+        histogram[key] = histogram.get(key, 0) + 1
+    return dict(sorted(histogram.items(), key=lambda item: _bucket_sort_key(item[0])))
+
+
+def _bucket_sort_key(bucket: str) -> int:
+    return int(bucket.split("-", 1)[0])
 
 
 def default_output_path(output_dir: Path) -> Path:
@@ -325,25 +437,25 @@ def main() -> None:
     parser.add_argument(
         "--coverage-threshold",
         type=float,
-        default=DEFAULT_CONFIG.homology_group_commit_coverage_threshold,
+        default=1.0,
         help="Pin coverage ratio required for a homology group to be committable.",
     )
     parser.add_argument(
         "--fanout-reuse-sorting",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_CONFIG.homology_use_fanout_reuse_for_sorting,
+        default=False,
         help="Whether multi-fanout pins boost homology sorting reuse count.",
     )
     parser.add_argument(
         "--skip-uncovered-groups",
         action=argparse.BooleanOptionalAction,
-        default=DEFAULT_CONFIG.homology_skip_uncovered_groups,
+        default=True,
         help="Mirror true-skip mode for homology groups below the skip coverage threshold.",
     )
     parser.add_argument(
         "--skip-coverage-threshold",
         type=float,
-        default=DEFAULT_CONFIG.homology_skip_coverage_threshold,
+        default=1.0,
         help="Coverage ratio below which true-skip mode removes a homology group from MCTS depth.",
     )
     args = parser.parse_args()

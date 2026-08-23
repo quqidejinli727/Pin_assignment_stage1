@@ -32,17 +32,25 @@ def net_hpwl(
     net: Net,
     placedb: PlaceDB,
     temporary_locations: Dict[str, Point],
+    excluded_pin_names: Set[str] | None = None,
+    *,
     skipped_pin_names: Set[str] | None = None,
 ) -> float:
-    """Compute one net HPWL, optionally removing truly skipped pins."""
-    skipped = skipped_pin_names or ()
+    """Compute HPWL while removing only explicitly invalid design pins.
+
+    ``skipped_pin_names`` remains a compatibility alias for callers that used
+    the old name for permanent exclusion.  Deferred MCTS groups must not be
+    supplied through either argument.
+    """
+    excluded = set(excluded_pin_names or ())
+    excluded.update(skipped_pin_names or ())
     locations_get = temporary_locations.get
     min_x = min_y = float("inf")
     max_x = max_y = float("-inf")
     active_count = 0
     for pin in net.pins:
         pin_name = pin.full_name
-        if pin_name in skipped:
+        if pin_name in excluded:
             continue
         point = locations_get(pin_name, _MISSING_POINT)
         if point is _MISSING_POINT:
@@ -80,48 +88,114 @@ class FeedthroughContext:
         auto_build_feedthrough: bool = False,
         cmake_generator: str | None = None,
         role: str = "feedthrough",
+        trace_enabled: bool = False,
     ):
+        init_started = time.perf_counter()
         self.placedb = placedb
+        executable_started = time.perf_counter()
         executable = ensure_ftpred_executable(
             feedthrough_source_dir,
             auto_build=auto_build_feedthrough,
             cmake_generator=cmake_generator,
         )
         self.role = role
+        self.trace_enabled = bool(trace_enabled)
+        self.trace_context_id = f"{os.getpid()}:{id(self)}"
+        self.trace_created_epoch = time.time()
+        self.trace_closed_epoch = None
+        self.trace_intervals = []
+        self.trace_dropped_intervals = 0
+        self.trace_batch_count = 0
+        self.trace_batch_net_count = 0
+        self.trace_batch_miss_count = 0
+        self.trace_batch_wall_seconds = 0.0
+        self.trace_batch_eval_seconds = 0.0
         self.executable = executable
+        self.trace_executable_seconds = time.perf_counter() - executable_started
+        loader_started = time.perf_counter()
         self.ftpred_loader = load_ftpred_loader(feedthrough_source_dir, role)
+        self.trace_loader_seconds = time.perf_counter() - loader_started
+        modules_started = time.perf_counter()
         modules_text = self.ftpred_loader.build_modules_text(placedb)
+        self.trace_modules_seconds = time.perf_counter() - modules_started
+        session_started = time.perf_counter()
         self.session = self.ftpred_loader.FtpredBinSession(str(executable), modules_text)
+        self.trace_session_seconds = time.perf_counter() - session_started
+        self.trace_init_seconds = time.perf_counter() - init_started
+        self.trace_child_pid = getattr(getattr(self.session, "_p", None), "pid", None)
         self.feedthrough_cache: Dict[Tuple[object, ...], float] = {}
         self.cache_hits = 0
         self.cache_misses = 0
+        self.batch_calls = 0
+        self.batch_request_count = 0
+        self.batch_miss_count = 0
 
     def close(self) -> None:
         """Close the long-lived predictor session."""
         if self.session is not None:
             self.session.close()
             self.session = None
+        if self.trace_enabled and self.trace_closed_epoch is None:
+            self.trace_closed_epoch = time.time()
+
+    def trace_summary(self) -> dict:
+        """Return in-memory FT trace data; no filesystem I/O is performed."""
+        session = self.session
+        process = getattr(session, "_p", None) if session is not None else None
+        durations = sorted(item[2] for item in self.trace_intervals)
+        p95_index = int(0.95 * (len(durations) - 1)) if durations else 0
+        return {
+            "enabled": self.trace_enabled,
+            "context_id": self.trace_context_id,
+            "worker_pid": os.getpid(),
+            "child_pid": self.trace_child_pid or getattr(process, "pid", None),
+            "executable": str(self.executable),
+            "init_seconds": self.trace_init_seconds,
+            "executable_seconds": self.trace_executable_seconds,
+            "loader_seconds": self.trace_loader_seconds,
+            "modules_seconds": self.trace_modules_seconds,
+            "session_seconds": self.trace_session_seconds,
+            "created_epoch": self.trace_created_epoch,
+            "closed_epoch": self.trace_closed_epoch,
+            "batch_count": self.trace_batch_count,
+            "batch_net_count": self.trace_batch_net_count,
+            "batch_miss_count": self.trace_batch_miss_count,
+            "batch_wall_seconds": self.trace_batch_wall_seconds,
+            "batch_eval_seconds": self.trace_batch_eval_seconds,
+            "batch_mean_seconds": (
+                sum(durations) / len(durations) if durations else 0.0
+            ),
+            "batch_p95_seconds": durations[p95_index] if durations else 0.0,
+            "first_batch_epoch": self.trace_intervals[0][0]
+            if self.trace_intervals
+            else None,
+            "last_batch_epoch": self.trace_intervals[-1][1]
+            if self.trace_intervals
+            else None,
+            "intervals": list(self.trace_intervals),
+            "dropped_intervals": self.trace_dropped_intervals,
+        }
 
     def run_one_net_at_locations(
         self,
         net: Net,
         locations: Dict[str, Point],
-        skipped_pin_names: Set[str] | None = None,
+        excluded_pin_names: Set[str] | None = None,
     ) -> float:
         """Evaluate one net after temporarily applying the given pin locations."""
         if self.session is None:
             raise RuntimeError("FeedthroughContext has already been closed.")
 
-        skipped_pin_names = skipped_pin_names or set()
+        excluded_pin_names = excluded_pin_names or set()
         old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
         old_pin_scopes = [(pin, pin.scope) for pin in net.pins]
         old_net_pins = list(net.pins)
         old_net_feedthrough = getattr(net, "feedthrough", 0.0)
         try:
-            if skipped_pin_names:
-                net.pins = [pin for pin in net.pins if pin.full_name not in skipped_pin_names]
+            if excluded_pin_names:
+                net.pins = [pin for pin in net.pins if pin.full_name not in excluded_pin_names]
                 for pin in old_net_pins:
-                    if pin.full_name in skipped_pin_names:
+                    if pin.full_name in excluded_pin_names:
                         pin.scope = []
             for pin in net.pins:
                 pin.x, pin.y = locations[pin.full_name]
@@ -141,16 +215,111 @@ class FeedthroughContext:
         net: Net,
         cache_key: Tuple[object, ...],
         locations_factory: Callable[[], Dict[str, Point]],
-        skipped_pin_names: Set[str] | None = None,
+        excluded_pin_names: Set[str] | None = None,
     ) -> float:
         """Evaluate one net with a full-flow cache and lazy location construction."""
         if cache_key in self.feedthrough_cache:
             self.cache_hits += 1
             return self.feedthrough_cache[cache_key]
         self.cache_misses += 1
-        value = self.run_one_net_at_locations(net, locations_factory(), skipped_pin_names)
+        value = self.run_one_net_at_locations(net, locations_factory(), excluded_pin_names)
         self.feedthrough_cache[cache_key] = value
         return value
+
+    def run_many_net_at_locations_cached(self, requests) -> list[float]:
+        """Batch cache misses while preserving per-net exact evaluator values."""
+        trace_started = time.time() if self.trace_enabled else 0.0
+        hits_before = self.cache_hits
+        misses_before = self.cache_misses
+        if not requests:
+            self.last_batch_location_seconds = 0.0
+            self.last_batch_eval_seconds = 0.0
+            return []
+        self.batch_calls += 1
+        self.batch_request_count += len(requests)
+        values = [None] * len(requests)
+        misses = []
+        for index, (net, cache_key, locations_factory, excluded_pin_names) in enumerate(requests):
+            if cache_key in self.feedthrough_cache:
+                self.cache_hits += 1
+                values[index] = self.feedthrough_cache[cache_key]
+            else:
+                self.cache_misses += 1
+                misses.append((index, net, cache_key, locations_factory, excluded_pin_names))
+        if misses:
+            self.batch_miss_count += len(misses)
+            prepared = []
+            location_seconds = 0.0
+            for _, net, _, locations_factory, excluded_pin_names in misses:
+                started = time.perf_counter()
+                locations = locations_factory()
+                location_seconds += time.perf_counter() - started
+                old_pin_locations = [(pin, pin.x, pin.y) for pin in net.pins]
+                old_pin_scopes = [(pin, pin.scope) for pin in net.pins]
+                old_net_pins = list(net.pins)
+                old_net_feedthrough = getattr(net, "feedthrough", 0.0)
+                try:
+                    if excluded_pin_names:
+                        net.pins = [
+                            pin for pin in net.pins
+                            if pin.full_name not in excluded_pin_names
+                        ]
+                        for pin in old_net_pins:
+                            if pin.full_name in excluded_pin_names:
+                                pin.scope = []
+                    for pin in net.pins:
+                        pin.x, pin.y = locations[pin.full_name]
+                    nets_text, build_info = self.ftpred_loader.build_nets_text(
+                        self.placedb, net, return_stats=True
+                    )
+                    prepared.append((net, nets_text, build_info))
+                finally:
+                    for pin, x, y in old_pin_locations:
+                        pin.x, pin.y = x, y
+                    for pin, scope in old_pin_scopes:
+                        pin.scope = scope
+                    net.pins = old_net_pins
+                    net.feedthrough = old_net_feedthrough
+            eval_started = time.perf_counter()
+            if hasattr(self.session, "run_many_nets"):
+                computed = self.session.run_many_nets(self.placedb, prepared)
+            else:
+                computed = [
+                    self.run_one_net_at_locations(net, locations_factory(), excluded_pin_names)
+                    for _, net, _, locations_factory, excluded_pin_names in misses
+                ]
+            eval_elapsed = time.perf_counter() - eval_started
+            self.last_batch_location_seconds = location_seconds
+            self.last_batch_eval_seconds = eval_elapsed
+            for (index, _, cache_key, _, _), value in zip(misses, computed):
+                values[index] = value
+                self.feedthrough_cache[cache_key] = value
+        else:
+            self.last_batch_location_seconds = 0.0
+            self.last_batch_eval_seconds = 0.0
+        if self.trace_enabled:
+            ended = time.time()
+            wall = max(0.0, ended - trace_started)
+            self.trace_batch_count += 1
+            self.trace_batch_net_count += len(requests)
+            self.trace_batch_miss_count += self.cache_misses - misses_before
+            self.trace_batch_wall_seconds += wall
+            self.trace_batch_eval_seconds += self.last_batch_eval_seconds
+            if len(self.trace_intervals) < 200000:
+                self.trace_intervals.append(
+                    (
+                        trace_started,
+                        ended,
+                        wall,
+                        self.cache_hits - hits_before,
+                        self.cache_misses - misses_before,
+                        self.last_batch_eval_seconds,
+                        len(requests),
+                    )
+                )
+            else:
+                self.trace_dropped_intervals += 1
+        return [float(value) for value in values]
 
 
 class RewardEvaluator:
@@ -167,6 +336,7 @@ class RewardEvaluator:
         normalization_floor: float = 1.0,
         reward_scale: float = 1.0,
         feedthrough_context: FeedthroughContext | None = None,
+        excluded_pin_names: Set[str] | None = None,
         skipped_pin_names: Set[str] | None = None,
     ):
         self.nets = list(nets)
@@ -177,10 +347,14 @@ class RewardEvaluator:
         self.normalization_floor = normalization_floor
         self.reward_scale = reward_scale
         self.feedthrough_context = feedthrough_context
-        self.skipped_pin_names = skipped_pin_names or set()
+        self.excluded_pin_names = set(excluded_pin_names or ())
+        self.excluded_pin_names.update(skipped_pin_names or ())
+        # Backward-compatible diagnostics alias.  New code uses the physical
+        # meaning explicitly and never fills it from deferred groups.
+        self.skipped_pin_names = self.excluded_pin_names
         self._net_active_pins = {
             id(net): tuple(
-                pin for pin in net.pins if pin.full_name not in self.skipped_pin_names
+                pin for pin in net.pins if pin.full_name not in self.excluded_pin_names
             )
             for net in self.nets
         }
@@ -197,6 +371,8 @@ class RewardEvaluator:
             "reward_feedthrough_eval": 0.0,
             "reward_hpwl_reference": 0.0,
         }
+        self.last_batch_location_seconds = 0.0
+        self.last_batch_eval_seconds = 0.0
         self.hpwl_profile: Dict[str, int] = {
             "candidate_calls": 0,
             "candidate_pin_visits": 0,
@@ -216,6 +392,19 @@ class RewardEvaluator:
             }
             for net in self.metric_nets
         }
+        # FeedthroughContext is intentionally shared by successive local trees.
+        # Include every physical endpoint's base location in candidate cache keys,
+        # because a deferred endpoint can move from its module centroid to a real
+        # assigned-segment midpoint between trees without becoming an action here.
+        self._net_base_location_signatures = {
+            net_id: tuple(
+                sorted(
+                    (pin_name, self._rounded_point(point))
+                    for pin_name, point in locations.items()
+                )
+            )
+            for net_id, locations in self._net_base_locations.items()
+        }
 
         if self.enable_feedthrough and self.feedthrough_context is None:
             raise ValueError("feedthrough_context is required when feedthrough reward is enabled.")
@@ -233,23 +422,47 @@ class RewardEvaluator:
         """Return weighted normalized reward for a complete candidate assignment."""
         started = time.perf_counter()
         total_reward = 0.0
+        wire_rewards = []
+        feedthrough_requests = []
         for net in self.metric_nets:
             reference = self.reference_metrics[id(net)]
             hpwl_started = time.perf_counter()
             candidate_hpwl = self._candidate_hpwl(net, temporary_locations)
             self.timing_profile["reward_hpwl"] += time.perf_counter() - hpwl_started
             wirelength_reward = self._normalized_improvement(reference.hpwl, candidate_hpwl)
-
-            feedthrough_reward_value = 0.0
+            wire_rewards.append((reference, wirelength_reward))
             if self.enable_feedthrough:
-                ft_started = time.perf_counter()
-                candidate_feedthrough = self._candidate_feedthrough(net, temporary_locations)
-                self.timing_profile["reward_feedthrough"] += time.perf_counter() - ft_started
-                feedthrough_reward_value = self._normalized_improvement(
-                    reference.feedthrough,
-                    candidate_feedthrough,
+                key, locations_factory = self._candidate_feedthrough_request(
+                    net, temporary_locations
                 )
-
+                feedthrough_requests.append(
+                    (net, key, locations_factory, self.excluded_pin_names)
+                )
+        feedthrough_values = []
+        if self.enable_feedthrough:
+            ft_started = time.perf_counter()
+            if hasattr(self.feedthrough_context, "run_many_net_at_locations_cached"):
+                feedthrough_values = self.feedthrough_context.run_many_net_at_locations_cached(
+                    feedthrough_requests
+                )
+                self.timing_profile["reward_feedthrough_eval"] += (
+                    self.feedthrough_context.last_batch_eval_seconds
+                )
+                self.timing_profile["reward_feedthrough_location"] += (
+                    self.feedthrough_context.last_batch_location_seconds
+                )
+            else:
+                feedthrough_values = [
+                    self._feedthrough_at_locations(net, key, factory, skipped)
+                    for net, key, factory, skipped in feedthrough_requests
+                ]
+            self.timing_profile["reward_feedthrough"] += time.perf_counter() - ft_started
+        for index, (reference, wirelength_reward) in enumerate(wire_rewards):
+            feedthrough_reward_value = (
+                self._normalized_improvement(reference.feedthrough, feedthrough_values[index])
+                if self.enable_feedthrough
+                else 0.0
+            )
             total_reward += (
                 self.wirelength_weight * wirelength_reward
                 + self.feedthrough_weight * feedthrough_reward_value
@@ -275,9 +488,9 @@ class RewardEvaluator:
         reference_feedthrough = (
             self._feedthrough_at_locations(
                 net,
-                ("reference", id(net), tuple(sorted(self.skipped_pin_names))),
+                ("reference", id(net), tuple(sorted(self.excluded_pin_names))),
                 lambda: reference_locations,
-                self.skipped_pin_names,
+                self.excluded_pin_names,
             )
             if self.enable_feedthrough
             else 0.0
@@ -353,6 +566,16 @@ class RewardEvaluator:
         net: Net,
         temporary_locations: Dict[str, Point],
     ) -> float:
+        key, locations_factory = self._candidate_feedthrough_request(net, temporary_locations)
+        return self._feedthrough_at_locations(
+            net, key, locations_factory, self.excluded_pin_names
+        )
+
+    def _candidate_feedthrough_request(
+        self,
+        net: Net,
+        temporary_locations: Dict[str, Point],
+    ):
         net_id = id(net)
         base_locations = self._net_base_locations[net_id]
         net_pin_names = self._net_pin_names[net_id]
@@ -366,22 +589,18 @@ class RewardEvaluator:
         key = (
             "candidate",
             net_id,
-            tuple(sorted(self.skipped_pin_names)),
+            tuple(sorted(self.excluded_pin_names)),
+            self._net_base_location_signatures[net_id],
             tuple(sorted(changed)),
         )
-        return self._feedthrough_at_locations(
-            net,
-            key,
-            lambda: self._net_locations_from_changes(net, temporary_locations),
-            self.skipped_pin_names,
-        )
+        return key, lambda: self._net_locations_from_changes(net, temporary_locations)
 
     def _feedthrough_at_locations(
         self,
         net: Net,
         cache_key: Tuple[object, ...],
         locations_factory: Callable[[], Dict[str, Point]],
-        skipped_pin_names: Set[str] | None = None,
+        excluded_pin_names: Set[str] | None = None,
     ) -> float:
         if self.feedthrough_context is None:
             return 0.0
@@ -396,7 +615,7 @@ class RewardEvaluator:
 
         eval_started = time.perf_counter()
         if not hasattr(self.feedthrough_context, "run_one_net_at_locations_cached"):
-            if not skipped_pin_names:
+            if not excluded_pin_names:
                 value = self.feedthrough_context.run_one_net_at_locations(
                     net,
                     timed_locations_factory(),
@@ -405,12 +624,12 @@ class RewardEvaluator:
                 value = self.feedthrough_context.run_one_net_at_locations(
                     net,
                     timed_locations_factory(),
-                    skipped_pin_names,
+                    excluded_pin_names,
                 )
             self.timing_profile["reward_feedthrough_eval"] += time.perf_counter() - eval_started
             self.timing_profile["reward_feedthrough_location"] += loc_elapsed
             return value
-        if not skipped_pin_names:
+        if not excluded_pin_names:
             value = self.feedthrough_context.run_one_net_at_locations_cached(
                 net,
                 cache_key,
@@ -421,7 +640,7 @@ class RewardEvaluator:
                 net,
                 cache_key,
                 timed_locations_factory,
-                skipped_pin_names,
+                excluded_pin_names,
             )
         self.timing_profile["reward_feedthrough_eval"] += time.perf_counter() - eval_started
         self.timing_profile["reward_feedthrough_location"] += loc_elapsed

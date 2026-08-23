@@ -109,6 +109,8 @@ class MCTSSolver:
         reward_scale: float = 1.0,
         enable_feedthrough: bool = True,
         feedthrough_context: FeedthroughContext | None = None,
+        deferred_group_names: Iterable[str] | None = None,
+        excluded_pin_names: Iterable[str] | None = None,
         skipped_group_names: Iterable[str] | None = None,
         skipped_pin_names: Iterable[str] | None = None,
     ):
@@ -118,14 +120,15 @@ class MCTSSolver:
         self.groups = groups
         self.nets = list(nets)
         self.groups_by_name = {group.name: group for group in self.groups}
-        self.skipped_group_names = set(skipped_group_names or [])
-        group_skipped_pin_names = {
-            pin.full_name
-            for group in self.groups
-            if group.name in self.skipped_group_names
-            for pin in group.pins
-        }
-        self.skipped_pin_names = set(skipped_pin_names or group_skipped_pin_names)
+        self.deferred_group_names = set(deferred_group_names or ())
+        self.deferred_group_names.update(skipped_group_names or ())
+        self.excluded_pin_names = set(excluded_pin_names or ())
+        self.excluded_pin_names.update(skipped_pin_names or ())
+        # Compatibility aliases only.  Deferred groups are deliberately not
+        # converted into excluded pins: decision scope and physical net scope
+        # are separate concepts.
+        self.skipped_group_names = self.deferred_group_names
+        self.skipped_pin_names = self.excluded_pin_names
         self.simulations = simulations
         self.exploration_constant = exploration_constant
         self.random = random.Random(random_seed)
@@ -219,7 +222,7 @@ class MCTSSolver:
             normalization_floor=reward_normalization_floor,
             reward_scale=reward_scale,
             feedthrough_context=feedthrough_context,
-            skipped_pin_names=self.skipped_pin_names,
+            excluded_pin_names=self.excluded_pin_names,
         )
 
     def _build_group_related_nets(self) -> Dict[str, List[Net]]:
@@ -252,13 +255,13 @@ class MCTSSolver:
         started = time.perf_counter()
         try:
             if self.groups and not any(
-                not group.assigned and not self._is_skipped_group(group)
+                not group.assigned and not self._is_deferred_group(group)
                 for group in self.groups
             ):
                 return {
                     group.name: SKIP_SEGMENT_ID
                     for group in self.groups
-                    if self._is_skipped_group(group)
+                    if self._is_deferred_group(group)
                 }
             if self.search_mode == "basic":
                 return self._search_basic()
@@ -287,7 +290,7 @@ class MCTSSolver:
         profile = self._search_profile(root.usage)
         self.last_search_profile = profile
         self._active_basic_depth = profile.depth
-        if self.enable_depth1_greedy and profile.depth == 1 and not self.skipped_group_names:
+        if self.enable_depth1_greedy and profile.depth == 1 and not self.deferred_group_names:
             return self._search_depth1_greedy(root)
 
         for _ in range(self._basic_simulation_budget(root.usage, profile)):
@@ -480,7 +483,7 @@ class MCTSSolver:
         branch_counts = [
             len(self._raw_feasible_segments(group, usage))
             for group in self.groups
-            if not group.assigned and not self._is_skipped_group(group)
+            if not group.assigned and not self._is_deferred_group(group)
         ]
         log_total_space = 0.0
         for count in branch_counts:
@@ -638,7 +641,7 @@ class MCTSSolver:
         active_groups = [
             group
             for group in self.groups
-            if not group.assigned and not self._is_skipped_group(group)
+            if not group.assigned and not self._is_deferred_group(group)
         ]
         if not active_groups:
             return 0.0
@@ -761,7 +764,7 @@ class MCTSSolver:
     ) -> List[Action]:
         """Return capacity-feasible actions, optionally candidate-pruned."""
         group = self.groups[node.group_index]
-        if self._is_skipped_group(group):
+        if self._is_deferred_group(group):
             return [(group.name, SKIP_SEGMENT_ID)]
         segments = self._candidate_segments(
             group,
@@ -893,7 +896,12 @@ class MCTSSolver:
         if self._group_related_nets is None:
             self._group_related_nets = self._build_group_related_nets()
         for net in self._group_related_nets.get(group.name, []):
-            score -= net_hpwl(net, self.placedb, temporary_locations, self.skipped_pin_names)
+            score -= net_hpwl(
+                net,
+                self.placedb,
+                temporary_locations,
+                self.excluded_pin_names,
+            )
         score += 1e-6 * segment.remaining_capacity
         self._candidate_score_cache[key] = score
         return score
@@ -907,7 +915,7 @@ class MCTSSolver:
         for index in range(node.group_index, len(self.groups)):
             group = self.groups[index]
             self.simulation_counts["groups_visited"] += 1
-            if self._is_skipped_group(group):
+            if self._is_deferred_group(group):
                 assignments[group.name] = SKIP_SEGMENT_ID
                 continue
             candidates_started = time.perf_counter()
@@ -1005,7 +1013,7 @@ class MCTSSolver:
         for group in self.groups:
             if group.assigned or group.name in assigned_names:
                 continue
-            if self._is_skipped_group(group):
+            if self._is_deferred_group(group):
                 completed[group.name] = SKIP_SEGMENT_ID
                 assigned_names.add(group.name)
                 continue
@@ -1059,7 +1067,7 @@ class MCTSSolver:
         for group in self.groups:
             if group.assigned or group.name in assigned_names:
                 continue
-            if self._is_skipped_group(group):
+            if self._is_deferred_group(group):
                 completed[group.name] = SKIP_SEGMENT_ID
                 assigned_names.add(group.name)
                 continue
@@ -1082,9 +1090,13 @@ class MCTSSolver:
         """Internal helper."""
         return self._complete_greedily({}, usage)
 
+    def _is_deferred_group(self, group: PinHomologyGroup) -> bool:
+        """Return whether this group is outside the current tree's decisions."""
+        return group.name in self.deferred_group_names
+
     def _is_skipped_group(self, group: PinHomologyGroup) -> bool:
-        """Return whether this group is a true skip action in the current local tree."""
-        return group.name in self.skipped_group_names
+        """Compatibility alias for the former deferred-group predicate."""
+        return self._is_deferred_group(group)
 
 
 def get_simulation_budget(group_count: int, base: int = 128) -> int:
